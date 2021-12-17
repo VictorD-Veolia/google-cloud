@@ -36,7 +36,7 @@ It can be found on the Dashboard in the Google Cloud Platform Console.
 **Path** Google Cloud Storage path to the marker file. This takes the format `gs://<bucket>/directory/marker-file-name`. 
 For example `gs://billing-data/2021-01-21/__SUCCESS`. The marker file will get created only if there is no previous
 marker file in that path. Otherwise, creating a new marker file will be skipped. If the bucket does not exist, it
-will get created automatically. 
+will get created automatically.
 
 * **Service Account**  Service account key used for authorization
 
@@ -45,6 +45,12 @@ authorization. Can be set to 'auto-detect' when running on a Dataproc cluster.
 When running on other clusters, the file must be present on every node in the cluster.
 
 **JSON**: Contents of the service account JSON file.
+
+**Location:** The location where the GCS bucket will get created.
+This value is ignored if the bucket already exists.
+
+**Encryption Key Name**: Used to encrypt data written to any bucket created by the plugin.
+If the bucket already exists, this is ignored.
 
 Example
 -------

@@ -23,6 +23,11 @@ Properties
 ----------
 **Reference Name:** Name used to uniquely identify this sink for lineage, annotating metadata, etc.
 
+**Use Connection** Whether to use a connection. If a connection is used, you do not need to provide the credentials.
+
+**Connection** Name of the connection to use. Project and service account information will be provided by the connection.
+You also can use the macro function ${conn(connection-name)}.
+
 **Project ID**: Google Cloud Project ID, which uniquely identifies a project.
 It can be found on the Dashboard in the Google Cloud Platform Console.
 
@@ -39,6 +44,9 @@ If the table does not exist, it will get created.
 
 **Primary Key**: If the table does not exist, a primary key must be provided in order to auto-create the table.
 The key can be a composite key of multiple fields in the schema. This is not required if the table already exists.
+
+**Encryption Key Name**: Used to encrypt data written to any database created by the plugin.
+If the database already exists, this is ignored.
 
 **Service Account**  - service account key used for authorization
 * **File Path**: Path on the local file system of the service account key used for

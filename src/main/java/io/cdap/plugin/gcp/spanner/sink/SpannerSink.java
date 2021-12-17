@@ -17,6 +17,7 @@
 package io.cdap.plugin.gcp.spanner.sink;
 
 import com.google.api.gax.longrunning.OperationFuture;
+import com.google.cloud.kms.v1.CryptoKeyName;
 import com.google.cloud.spanner.Database;
 import com.google.cloud.spanner.DatabaseAdminClient;
 import com.google.cloud.spanner.DatabaseClient;
@@ -26,13 +27,20 @@ import com.google.cloud.spanner.Mutation;
 import com.google.cloud.spanner.ResultSet;
 import com.google.cloud.spanner.Spanner;
 import com.google.cloud.spanner.SpannerException;
+import com.google.cloud.spanner.SpannerExceptionFactory;
+import com.google.cloud.spanner.SpannerOptions;
 import com.google.cloud.spanner.Statement;
+import com.google.cloud.spanner.encryption.EncryptionConfigs;
 import com.google.common.base.Strings;
 import com.google.spanner.admin.database.v1.CreateDatabaseMetadata;
+import com.google.spanner.admin.database.v1.CreateDatabaseRequest;
 import com.google.spanner.admin.database.v1.UpdateDatabaseDdlMetadata;
 import io.cdap.cdap.api.annotation.Description;
+import io.cdap.cdap.api.annotation.Metadata;
+import io.cdap.cdap.api.annotation.MetadataProperty;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.annotation.Plugin;
+import io.cdap.cdap.api.annotation.Requirements;
 import io.cdap.cdap.api.data.batch.Output;
 import io.cdap.cdap.api.data.format.StructuredRecord;
 import io.cdap.cdap.api.data.schema.Schema;
@@ -43,10 +51,14 @@ import io.cdap.cdap.etl.api.PipelineConfigurer;
 import io.cdap.cdap.etl.api.batch.BatchRuntimeContext;
 import io.cdap.cdap.etl.api.batch.BatchSink;
 import io.cdap.cdap.etl.api.batch.BatchSinkContext;
+import io.cdap.cdap.etl.api.connector.Connector;
 import io.cdap.plugin.common.LineageRecorder;
 import io.cdap.plugin.common.ReferenceBatchSink;
 import io.cdap.plugin.common.batch.sink.SinkOutputFormatProvider;
+import io.cdap.plugin.gcp.common.CmekUtils;
+import io.cdap.plugin.gcp.common.GCPUtils;
 import io.cdap.plugin.gcp.spanner.common.SpannerUtil;
+import io.cdap.plugin.gcp.spanner.connector.SpannerConnector;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.NullWritable;
 import org.slf4j.Logger;
@@ -56,6 +68,8 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
@@ -73,6 +87,7 @@ import javax.annotation.Nullable;
 @Description("Batch sink to write to Cloud Spanner. Cloud Spanner is a fully managed, mission-critical, " +
   "relational database service that offers transactional consistency at global scale, schemas, " +
   "SQL (ANSI 2011 with extensions), and automatic, synchronous replication for high availability.")
+@Metadata(properties = {@MetadataProperty(key = Connector.PLUGIN_TYPE, value = SpannerConnector.NAME)})
 public final class SpannerSink extends BatchSink<StructuredRecord, NullWritable, Mutation> {
   private static final Logger LOG = LoggerFactory.getLogger(SpannerSink.class);
   public static final String NAME = "Spanner";
@@ -95,20 +110,20 @@ public final class SpannerSink extends BatchSink<StructuredRecord, NullWritable,
   @Override
   public void prepareRun(BatchSinkContext context) throws Exception {
     FailureCollector collector = context.getFailureCollector();
-    config.validate(collector);
+    config.validate(collector, context.getArguments().asMap());
     // throw a validation exception if any failures were added to the collector.
     collector.getOrThrowException();
 
     Schema configuredSchema = config.getSchema(collector);
     Schema schema = configuredSchema == null ? context.getInputSchema() : configuredSchema;
     if (!context.isPreviewEnabled()) {
-      try (Spanner spanner = SpannerUtil.getSpannerService(config.getServiceAccount(),
-                                                           config.isServiceAccountFilePath(), config.getProject())) {
-        DatabaseId db = DatabaseId.of(config.getProject(), config.getInstance(), config.getDatabase());
-        DatabaseClient dbClient = spanner.getDatabaseClient(db);
-        DatabaseAdminClient dbAdminClient = spanner.getDatabaseAdminClient();
+      try (Spanner spanner = SpannerUtil.getSpannerService(config.connection)) {
         // create database
-        Database database = getOrCreateDatabase(dbAdminClient);
+        DatabaseAdminClient dbAdminClient = spanner.getDatabaseAdminClient();
+        Database database = getOrCreateDatabase(context, dbAdminClient);
+
+        DatabaseId db = DatabaseId.of(config.connection.getProject(), config.getInstance(), config.getDatabase());
+        DatabaseClient dbClient = spanner.getDatabaseClient(db);
         if (!isTablePresent(dbClient) && schema == null) {
           throw new IllegalArgumentException(String.format("Spanner table %s does not exist. To create it from the " +
                                                              "pipeline, schema must be provided",
@@ -181,16 +196,37 @@ public final class SpannerSink extends BatchSink<StructuredRecord, NullWritable,
   }
 
   private Database getOrCreateDatabase(
+    BatchSinkContext context,
     DatabaseAdminClient dbAdminClient) throws ExecutionException, InterruptedException {
     Database database = getDatabaseIfPresent(dbAdminClient);
 
     if (database == null) {
       LOG.debug("Database not found. Creating database {} in instance {}.", config.getDatabase(), config.getInstance());
       // Create database
+      Database.Builder dbBuilder = dbAdminClient
+        .newDatabaseBuilder(DatabaseId.of(config.connection.getProject(), config.getInstance(), config.getDatabase()));
+      CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(config.cmekKey, context.getArguments().asMap(),
+                                                       context.getFailureCollector());
+      context.getFailureCollector().getOrThrowException();
+      if (cmekKeyName != null) {
+        dbBuilder.setEncryptionConfig(EncryptionConfigs.customerManagedEncryption(cmekKeyName.toString()));
+      }
       OperationFuture<Database, CreateDatabaseMetadata> op =
-        dbAdminClient.createDatabase(config.getInstance(), config.getDatabase(), Collections.emptyList());
+        dbAdminClient.createDatabase(dbBuilder.build(), Collections.emptyList());
       // database creation is an async operation. Wait until database creation operation is complete.
-      database = op.get();
+      try {
+        database = op.get(120, TimeUnit.SECONDS);
+      } catch (ExecutionException e) {
+        // If the operation failed during execution, expose the cause.
+        throw SpannerExceptionFactory.asSpannerException(e.getCause());
+      } catch (InterruptedException e) {
+        // Throw when a thread is waiting, sleeping, or otherwise occupied,
+        // and the thread is interrupted, either before or during the activity.
+        throw SpannerExceptionFactory.propagateInterrupt(e);
+      } catch (TimeoutException e) {
+        // If the operation timed out propagates the timeout
+        throw SpannerExceptionFactory.propagateTimeout(e);
+      }
     }
 
     return database;

@@ -29,9 +29,9 @@ import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.etl.api.FailureCollector;
+import io.cdap.plugin.common.ConfigUtil;
 import io.cdap.plugin.gcp.bigquery.source.BigQuerySource;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
-import io.cdap.plugin.gcp.common.ConfigUtil;
 
 import java.util.AbstractMap.SimpleEntry;
 import java.util.List;
@@ -178,6 +178,9 @@ public final class BigQueryArgumentSetterConfig extends AbstractBigQueryActionCo
   }
 
   public QueryJobConfiguration getQueryJobConfiguration(FailureCollector collector) {
+    //below one should pass in the dataset project while this config doesn't have a dataset project
+    //project is where the job is run and dataset project is where the dataset is in
+    //TODO: https://cdap.atlassian.net/browse/PLUGIN-926
     Table sourceTable = BigQueryUtil.getBigQueryTable(getProject(), dataset, table, getServiceAccount(),
                                                       isServiceAccountFilePath(), collector);
 

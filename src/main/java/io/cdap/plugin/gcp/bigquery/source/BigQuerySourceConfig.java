@@ -16,40 +16,71 @@
 
 package io.cdap.plugin.gcp.bigquery.source;
 
+import com.google.auth.Credentials;
+import com.google.auth.oauth2.ServiceAccountCredentials;
+import com.google.cloud.ServiceOptions;
+import com.google.cloud.bigquery.BigQuery;
+import com.google.cloud.bigquery.Dataset;
+import com.google.cloud.bigquery.DatasetId;
 import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableDefinition.Type;
+import com.google.cloud.kms.v1.CryptoKeyName;
+import com.google.cloud.storage.Storage;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSet;
 import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.data.schema.Schema;
+import io.cdap.cdap.api.plugin.PluginConfig;
+import io.cdap.cdap.etl.api.Arguments;
 import io.cdap.cdap.etl.api.FailureCollector;
-import io.cdap.plugin.gcp.bigquery.common.BigQueryBaseConfig;
+import io.cdap.plugin.common.ConfigUtil;
+import io.cdap.plugin.common.Constants;
+import io.cdap.plugin.common.IdUtils;
+import io.cdap.plugin.gcp.bigquery.connector.BigQueryConnectorConfig;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
+import io.cdap.plugin.gcp.common.CmekUtils;
+import io.cdap.plugin.gcp.common.GCPUtils;
+import io.cdap.plugin.gcp.gcs.GCSPath;
 
 import java.io.IOException;
+import java.util.Collections;
+import java.util.Map;
 import java.util.Set;
 import javax.annotation.Nullable;
 
 /**
  * Holds configuration required for configuring {@link BigQuerySource}.
  */
-public final class BigQuerySourceConfig extends BigQueryBaseConfig {
+public final class BigQuerySourceConfig extends PluginConfig {
+  private static final String SCHEME = "gs://";
   private static final String WHERE = "WHERE";
   public static final Set<Schema.Type> SUPPORTED_TYPES =
     ImmutableSet.of(Schema.Type.LONG, Schema.Type.STRING, Schema.Type.DOUBLE, Schema.Type.BOOLEAN, Schema.Type.BYTES,
                     Schema.Type.ARRAY, Schema.Type.RECORD);
 
+  public static final String NAME_DATASET = "dataset";
   public static final String NAME_TABLE = "table";
+  public static final String NAME_BUCKET = "bucket";
   public static final String NAME_SCHEMA = "schema";
-  public static final String NAME_DATASET_PROJECT = "datasetProject";
   public static final String NAME_PARTITION_FROM = "partitionFrom";
   public static final String NAME_PARTITION_TO = "partitionTo";
   public static final String NAME_FILTER = "filter";
   public static final String NAME_ENABLE_QUERYING_VIEWS = "enableQueryingViews";
   public static final String NAME_VIEW_MATERIALIZATION_PROJECT = "viewMaterializationProject";
   public static final String NAME_VIEW_MATERIALIZATION_DATASET = "viewMaterializationDataset";
+  public static final String NAME_CMEK_KEY = "cmekKey";
+
+  @Name(Constants.Reference.REFERENCE_NAME)
+  @Description("This will be used to uniquely identify this source for lineage, annotating metadata, etc.")
+  public String referenceName;
+
+  @Name(NAME_DATASET)
+  @Macro
+  @Description("The dataset the table belongs to. A dataset is contained within a specific project. "
+    + "Datasets are top-level containers that are used to organize and control access to tables and views.")
+  private String dataset;
 
   @Name(NAME_TABLE)
   @Macro
@@ -57,6 +88,15 @@ public final class BigQuerySourceConfig extends BigQueryBaseConfig {
     + "Each record is composed of columns (also called fields). "
     + "Every table is defined by a schema that describes the column names, data types, and other information.")
   private String table;
+
+  @Name(NAME_BUCKET)
+  @Macro
+  @Nullable
+  @Description("The Google Cloud Storage bucket to store temporary data in. "
+    + "Temporary data will be deleted after it has been read. "
+    + "If it is not provided, a unique bucket will be created and then deleted after the run finishes. "
+    + "The service account must have permission to create buckets in the configured project.")
+  private String bucket;
 
   @Name(NAME_SCHEMA)
   @Macro
@@ -106,12 +146,90 @@ public final class BigQuerySourceConfig extends BigQueryBaseConfig {
     + "Defaults to the same dataset in which the view is located.")
   private String viewMaterializationDataset;
 
+  @Name(ConfigUtil.NAME_USE_CONNECTION)
+  @Nullable
+  @Description("Whether to use an existing connection.")
+  private Boolean useConnection;
+
+  @Name(ConfigUtil.NAME_CONNECTION)
+  @Macro
+  @Nullable
+  @Description("The existing connection to use.")
+  private BigQueryConnectorConfig connection;
+
+  @Name(NAME_CMEK_KEY)
+  @Macro
+  @Nullable
+  @Description("The GCP customer managed encryption key (CMEK) name used to encrypt data written to " +
+    "any bucket created by the plugin. If the bucket already exists, this is ignored.")
+  protected String cmekKey;
+
+
+  public String getDataset() {
+    return dataset;
+  }
+
   public String getTable() {
     return table;
   }
 
+  @Nullable
+  public String getBucket() {
+    if (bucket != null) {
+      bucket = bucket.trim();
+      // remove the gs:// scheme from the bucket name
+      if (bucket.startsWith(SCHEME)) {
+        bucket = bucket.substring(SCHEME.length());
+      }
+      if (bucket.isEmpty()) {
+        return null;
+      }
+    }
+    return bucket;
+  }
+
+  public String getDatasetProject() {
+    if (connection == null) {
+      return ServiceOptions.getDefaultProjectId();
+    }
+    return connection.getDatasetProject();
+  }
+
+  public String getProject() {
+    if (connection == null) {
+      throw new IllegalArgumentException(
+        "Could not get project information, connection should not be null!");
+    }
+    return connection.getProject();
+  }
+
+  @Nullable
+  public String tryGetProject() {
+    return connection == null ? null : connection.tryGetProject();
+  }
+
+  @Nullable
+  public String getServiceAccount() {
+    return connection == null ? null : connection.getServiceAccount();
+  }
+
+  @Nullable
+  public Boolean isServiceAccountFilePath() {
+    return connection == null ? null : connection.isServiceAccountFilePath();
+  }
+
+  @Nullable
+  public String getServiceAccountType() {
+    return connection == null ? null : connection.getServiceAccountType();
+  }
+
   public void validate(FailureCollector collector) {
-    super.validate(collector);
+    validate(collector, Collections.emptyMap());
+  }
+
+  public void validate(FailureCollector collector, Map<String, String> arguments) {
+    IdUtils.validateReferenceName(referenceName, collector);
+    ConfigUtil.validateConnection(this, useConnection, connection, collector);
     String bucket = getBucket();
 
     if (!containsMacro(NAME_BUCKET)) {
@@ -125,6 +243,36 @@ public final class BigQuerySourceConfig extends BigQueryBaseConfig {
     if (!containsMacro(NAME_TABLE)) {
       validateTable(collector);
     }
+    if (!containsMacro(NAME_CMEK_KEY)) {
+      validateCmekKey(collector, arguments);
+    }
+  }
+
+  void validateCmekKey(FailureCollector collector, Map<String, String> arguments) {
+    CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(cmekKey, arguments, collector);
+    //these fields are needed to check if bucket exists or not and for location validation
+    if (cmekKeyName == null || !canConnect() || containsMacro(NAME_BUCKET)) {
+      return;
+    }
+    DatasetId datasetId = DatasetId.of(getDatasetProject(), getDataset());
+    Credentials credentials = connection.getCredentials(collector);
+    BigQuery bigQuery = GCPUtils.getBigQuery(getProject(), credentials);
+    if (bigQuery == null) {
+      return;
+    }
+    Dataset dataset = null;
+    try {
+      dataset = bigQuery.getDataset(datasetId);
+    } catch (Exception e) {
+      //If there is an exception getting dataset information during validation, it will be ignored.
+      return;
+    }
+    Storage storage = GCPUtils.getStorage(getProject(), credentials);
+    if (dataset == null || storage == null) {
+      return;
+    }
+    GCSPath gcsPath = Strings.isNullOrEmpty(bucket) ? null : GCSPath.from(bucket);
+    CmekUtils.validateCmekKeyAndBucketLocation(storage, gcsPath, cmekKeyName, dataset.getLocation(), collector);
   }
 
   private void validateTable(FailureCollector collector) {
@@ -147,10 +295,12 @@ public final class BigQuerySourceConfig extends BigQueryBaseConfig {
    */
   public Type getSourceTableType() {
     Table sourceTable =
-      BigQueryUtil.getBigQueryTable(
-        getDatasetProject(), getDataset(), table, getServiceAccount(), isServiceAccountFilePath());
+      BigQueryUtil.getBigQueryTable(getDatasetProject(), getDataset(), table, getServiceAccount(),
+                                    isServiceAccountFilePath());
     return sourceTable != null ? sourceTable.getDefinition().getType() : null;
   }
+
+
 
 
   /**
@@ -217,9 +367,82 @@ public final class BigQuerySourceConfig extends BigQueryBaseConfig {
    */
   public boolean canConnect() {
     return !containsMacro(NAME_SCHEMA) && !containsMacro(NAME_DATASET) && !containsMacro(NAME_TABLE) &&
-      !containsMacro(NAME_DATASET_PROJECT) &&
-      !containsMacro(NAME_SERVICE_ACCOUNT_TYPE) &&
-      !(containsMacro(NAME_SERVICE_ACCOUNT_FILE_PATH) || containsMacro(NAME_SERVICE_ACCOUNT_JSON)) &&
-      !containsMacro(NAME_PROJECT);
+      connection != null && connection.canConnect();
+  }
+
+  /**
+   * Return true if the service account is set to auto-detect but it can't be fetched from the environment.
+   * This shouldn't result in a deployment failure, as the credential could be detected at runtime if the pipeline
+   * runs on dataproc. This should primarily be used to check whether certain validation logic should be skipped.
+   *
+   * @return true if the service account is set to auto-detect but it can't be fetched from the environment.
+   */
+  public boolean autoServiceAccountUnavailable() {
+    if (connection == null || connection.getServiceAccountFilePath() == null &&
+      connection.isServiceAccountFilePath()) {
+      try {
+        ServiceAccountCredentials.getApplicationDefault();
+      } catch (IOException e) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public BigQueryConnectorConfig getConnection() {
+    return connection;
+  }
+
+  private BigQuerySourceConfig(@Nullable BigQueryConnectorConfig connection, @Nullable String dataset,
+                               @Nullable String cmekKey, @Nullable String bucket, @Nullable String table) {
+    this.connection = connection;
+    this.dataset = dataset;
+    this.cmekKey = cmekKey;
+    this.bucket = bucket;
+    this.table = table;
+  }
+
+  public static Builder builder() {
+     return new Builder();
+  }
+
+  /**
+   * BigQuery Source configuration builder.
+   */
+  public static class Builder {
+    private BigQueryConnectorConfig connection;
+    private String dataset;
+    private String cmekKey;
+    private String bucket;
+    private String table;
+
+    public Builder setConnection(@Nullable BigQueryConnectorConfig connection) {
+      this.connection = connection;
+      return this;
+    }
+
+    public Builder setDataset(@Nullable String dataset) {
+      this.dataset = dataset;
+      return this;
+    }
+
+    public Builder setTable(@Nullable String table) {
+      this.table = table;
+      return this;
+    }
+
+    public Builder setCmekKey(@Nullable String cmekKey) {
+      this.cmekKey = cmekKey;
+      return this;
+    }
+
+    public Builder setBucket(@Nullable String bucket) {
+      this.bucket = bucket;
+      return this;
+    }
+
+    public BigQuerySourceConfig build() {
+      return new BigQuerySourceConfig(connection, dataset, cmekKey, bucket, table);
+    }
   }
 }

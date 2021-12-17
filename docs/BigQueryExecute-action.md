@@ -23,6 +23,11 @@ Properties
 It can be found on the Dashboard in the Google Cloud Platform Console.
 This is the project that the BigQuery SQL will run in.
 
+**Dataset Project ID**: Project ID of the dataset to store the query results in. This is only required if the 
+dataset is not in the same project that the BigQuery job will run in. If no value is given, it will default to the
+configured Project ID. `BigQuery Data Editor` role on this project must be granted to the specified service account to
+write BigQuery data to this project.
+
 **SQL**: SQL command to execute.
 
 **Dialect**: Dialect of the SQL command. The value must be 'legacy' or 'standard'. If set to 'standard',
@@ -42,6 +47,9 @@ started within 3 hours, its priority is changed to 'interactive'.
 cache that will be flushed whenever tables in the query are modified.
 
 **Job Location**: Location of the job. It must match the location of the dataset specified in the query.
+
+**Encryption Key Name**: Used to encrypt data written to any dataset or table created by the plugin.
+If the dataset or table already exists, this is ignored.
 
 **Row As Arguments**: Row as arguments. For example, if the query is 'select min(id) as min_id, max(id) as max_id from my_dataset.my_table',
 an arguments for 'min_id' and 'max_id' will be set based on the query results. Plugins further down the pipeline can then

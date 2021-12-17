@@ -19,14 +19,17 @@ package io.cdap.plugin.gcp.bigquery.source;
 import com.google.auth.Credentials;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.Dataset;
+import com.google.cloud.bigquery.DatasetId;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.hadoop.io.bigquery.BigQueryConfiguration;
-import io.cdap.plugin.gcp.bigquery.common.BigQueryBaseConfig;
+import com.google.cloud.kms.v1.CryptoKeyName;
+import com.google.cloud.storage.Storage;
+import com.google.cloud.storage.StorageException;
+import io.cdap.plugin.gcp.bigquery.connector.BigQueryConnectorConfig;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryConstants;
+import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
 import io.cdap.plugin.gcp.common.GCPUtils;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,9 +46,12 @@ public class BigQuerySourceUtils {
   public static final String GCS_BUCKET_FORMAT = "gs://%s";
   public static final String GS_PATH_FORMAT = GCS_BUCKET_FORMAT + "/%s";
   private static final String TEMPORARY_BUCKET_FORMAT = GS_PATH_FORMAT + "/hadoop/input/%s";
+  private static final String BQ_TEMP_BUCKET_NAME_PREFIX = "bq-source-bucket-";
+  private static final String BQ_TEMP_BUCKET_NAME_TEMPLATE = BQ_TEMP_BUCKET_NAME_PREFIX + "%s";
+  private static final String BQ_TEMP_BUCKET_PATH_TEMPLATE = "gs://" + BQ_TEMP_BUCKET_NAME_TEMPLATE;
 
   @Nullable
-  public static Credentials getCredentials(BigQueryBaseConfig config) throws IOException {
+  public static Credentials getCredentials(BigQueryConnectorConfig config) throws IOException {
     return config.getServiceAccount() == null ?
       null : GCPUtils.loadServiceAccountCredentials(config.getServiceAccount(), config.isServiceAccountFilePath());
   }
@@ -57,33 +63,41 @@ public class BigQuerySourceUtils {
    * to auto-delete this bucket on completion.
    *
    * @param configuration Hadoop configuration instance.
-   * @param config BigQuery configuration.
-   * @param bigQuery BigQuery client.
-   * @param credentials Google Cloud Credentials.
+   * @param storage GCS Storage client
+   * @param bucket GCS bucket
+   * @param dataset BigQuery dataset
    * @param bucketPath bucket path to use. Will be used as a bucket name if needed..
-   * @param cmekKey CMEK key to use for the auto-created bucket.
+   * @param cmekKeyName CMEK key to use for the auto-created bucket.
    * @return Bucket name.
    */
   public static String getOrCreateBucket(Configuration configuration,
-                                         BigQueryBaseConfig config,
-                                         BigQuery bigQuery,
-                                         Credentials credentials,
+                                         Storage storage,
+                                         @Nullable String bucket,
+                                         Dataset dataset,
                                          String bucketPath,
-                                         @Nullable String cmekKey) {
-    String bucket = config.getBucket();
-
+                                         @Nullable CryptoKeyName cmekKeyName) throws IOException {
+    // Create a new bucket if needed
     if (bucket == null) {
-      bucket = "bq-source-bucket-" + bucketPath;
+      bucket = String.format(BQ_TEMP_BUCKET_NAME_TEMPLATE, bucketPath);
       // By default, this option is false, meaning the job can not delete the bucket. So enable it only when bucket name
       // is not provided.
       configuration.setBoolean("fs.gs.bucket.delete.enable", true);
-
-      // the dataset existence is validated before, so this cannot be null
-      Dataset dataset = bigQuery.getDataset(config.getDataset());
-      GCPUtils.createBucket(GCPUtils.getStorage(config.getProject(), credentials),
-                            bucket,
-                            dataset.getLocation(),
-                            cmekKey);
+      GCPUtils.createBucket(storage, bucket, dataset.getLocation(), cmekKeyName);
+    } else if (storage != null && storage.get(bucket) == null) {
+      try {
+        GCPUtils.createBucket(storage, bucket, dataset.getLocation(), cmekKeyName);
+      } catch (StorageException e) {
+        if (e.getCode() == 409) {
+          // A conflict means the bucket already exists
+          // This most likely means multiple stages in the same pipeline are trying to create the same bucket.
+          // Ignore this and move on, since all that matters is that the bucket exists.
+          return bucket;
+        }
+        throw new IOException(String.format("Unable to create Cloud Storage bucket '%s' in the same " +
+                                              "location ('%s') as BigQuery dataset '%s'. " + "Please use a bucket " +
+                                              "that is in the same location as the dataset.",
+                                            bucket, dataset.getLocation(), dataset.getDatasetId().getDataset()), e);
+      }
     }
 
     return bucket;
@@ -93,9 +107,9 @@ public class BigQuerySourceUtils {
    * Sets up service account credentials into supplied Hadoop configuration.
    *
    * @param configuration Hadoop Configuration instance.
-   * @param config Big Query configuration.
+   * @param config BigQuery connection configuration.
    */
-  public static void configureServiceAccount(Configuration configuration, BigQueryBaseConfig config) {
+  public static void configureServiceAccount(Configuration configuration, BigQueryConnectorConfig config) {
     if (config.getServiceAccount() != null) {
       configuration.set(BigQueryConstants.CONFIG_SERVICE_ACCOUNT, config.getServiceAccount());
       configuration.setBoolean(BigQueryConstants.CONFIG_SERVICE_ACCOUNT_IS_FILE, config.isServiceAccountFilePath());
@@ -106,15 +120,13 @@ public class BigQuerySourceUtils {
    * Configure BigQuery input using the supplied configuration and GCS path.
    *
    * @param configuration Hadoop configuration instance.
-   * @param project the project to use.
    * @param dataset the dataset to use.
    * @param table the name of the table to pull from.
    * @param gcsPath Path to use to store output files.
    * @throws IOException if the BigQuery input could not be configured.
    */
   public static void configureBigQueryInput(Configuration configuration,
-                                            String project,
-                                            String dataset,
+                                            DatasetId dataset,
                                             String table,
                                             String gcsPath) throws IOException {
     // Configure GCS bucket path
@@ -132,8 +144,8 @@ public class BigQuerySourceUtils {
     PartitionedBigQueryInputFormat.setTemporaryCloudStorageDirectory(configuration,
                                                                      gcsPath);
     BigQueryConfiguration.configureBigQueryInput(configuration,
-                                                 project,
-                                                 dataset,
+                                                 dataset.getProject(),
+                                                 dataset.getDataset(),
                                                  table);
   }
 
@@ -153,14 +165,14 @@ public class BigQuerySourceUtils {
    * Deletes temporary BigQuery table used to export records from views.
    *
    * @param configuration Hadoop Configuration.
-   * @param config BigQuery configuration.
+   * @param config BigQuery source configuration.
    */
-  public static void deleteBigQueryTemporaryTable(Configuration configuration, BigQueryBaseConfig config) {
+  public static void deleteBigQueryTemporaryTable(Configuration configuration, BigQuerySourceConfig config) {
     String temporaryTable = configuration.get(BigQueryConstants.CONFIG_TEMPORARY_TABLE_NAME);
     try {
-      Credentials credentials = getCredentials(config);
-      BigQuery bigQuery = GCPUtils.getBigQuery(config.getDatasetProject(), credentials);
-      bigQuery.delete(TableId.of(config.getProject(), config.getDataset(), temporaryTable));
+      Credentials credentials = getCredentials(config.getConnection());
+      BigQuery bigQuery = GCPUtils.getBigQuery(config.getProject(), credentials);
+      bigQuery.delete(TableId.of(config.getDatasetProject(), config.getDataset(), temporaryTable));
       LOG.debug("Deleted temporary table '{}'", temporaryTable);
     } catch (IOException e) {
       LOG.error("Failed to load service account credentials: {}", e.getMessage(), e);
@@ -171,28 +183,24 @@ public class BigQuerySourceUtils {
    * Deletes temporary GCS directory.
    *
    * @param configuration Hadoop Configuration.
-   * @param config BigQuery configuration.
+   * @param bucket the bucket name
    * @param runId the run ID
    */
   public static void deleteGcsTemporaryDirectory(Configuration configuration,
-                                                 BigQueryBaseConfig config,
+                                                 String bucket,
                                                  String runId) {
-    Path gcsPath = null;
-    String bucket = config.getBucket();
-    // If the bucket was created for this run, delete it.
+    String gcsPath;
+    // If the bucket was created for this run, build temp path name using the bucket path and delete the entire bucket.
     if (bucket == null) {
-      gcsPath = new Path(String.format(GCS_BUCKET_FORMAT, runId));
+      gcsPath = String.format(BQ_TEMP_BUCKET_PATH_TEMPLATE, runId);
     } else {
-      gcsPath = new Path(String.format(GS_PATH_FORMAT, bucket, runId));
+      gcsPath = String.format(GS_PATH_FORMAT, bucket, runId);
     }
+
     try {
-      FileSystem fs = gcsPath.getFileSystem(configuration);
-      if (fs.exists(gcsPath)) {
-        fs.delete(gcsPath, true);
-        LOG.debug("Deleted temporary directory '{}'", gcsPath);
-      }
+      BigQueryUtil.deleteTemporaryDirectory(configuration, gcsPath);
     } catch (IOException e) {
-      LOG.warn("Failed to delete temporary directory '{}': {}", gcsPath, e.getMessage());
+      LOG.error("Failed to delete temporary directory '{}': {}", gcsPath, e.getMessage());
     }
   }
 }

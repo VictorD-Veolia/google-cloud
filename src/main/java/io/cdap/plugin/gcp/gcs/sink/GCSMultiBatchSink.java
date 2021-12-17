@@ -17,11 +17,14 @@
 package io.cdap.plugin.gcp.gcs.sink;
 
 import com.google.auth.Credentials;
+import com.google.cloud.kms.v1.CryptoKeyName;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageException;
 import com.google.common.base.Strings;
 import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
+import io.cdap.cdap.api.annotation.Metadata;
+import io.cdap.cdap.api.annotation.MetadataProperty;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.annotation.Plugin;
 import io.cdap.cdap.api.data.batch.Output;
@@ -35,10 +38,12 @@ import io.cdap.cdap.etl.api.FailureCollector;
 import io.cdap.cdap.etl.api.PipelineConfigurer;
 import io.cdap.cdap.etl.api.batch.BatchSink;
 import io.cdap.cdap.etl.api.batch.BatchSinkContext;
+import io.cdap.cdap.etl.api.connector.Connector;
 import io.cdap.cdap.etl.api.validation.ValidatingOutputFormat;
 import io.cdap.plugin.common.batch.sink.SinkOutputFormatProvider;
-import io.cdap.plugin.format.FileFormat;
+import io.cdap.plugin.gcp.common.CmekUtils;
 import io.cdap.plugin.gcp.common.GCPUtils;
+import io.cdap.plugin.gcp.gcs.connector.GCSConnector;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
@@ -54,10 +59,12 @@ import javax.annotation.Nullable;
  * {@link GCSMultiBatchSink} that stores the data of the latest run of an adapter in GCS.
  */
 @Plugin(type = BatchSink.PLUGIN_TYPE)
-@Name("GCSMultiFiles")
+@Name(GCSMultiBatchSink.NAME)
 @Description("Writes records to one or more Avro, ORC, Parquet or Delimited format files in a directory " +
   "on Google Cloud Storage.")
+@Metadata(properties = {@MetadataProperty(key = Connector.PLUGIN_TYPE, value = GCSConnector.NAME)})
 public class GCSMultiBatchSink extends BatchSink<StructuredRecord, NullWritable, StructuredRecord> {
+  public static final String NAME = "GCSMultiFiles";
   private static final String TABLE_PREFIX = "multisink.";
   private static final String FORMAT_PLUGIN_ID = "format";
   private static final String SCHEMA_MACRO = "__provided_schema__";
@@ -74,7 +81,7 @@ public class GCSMultiBatchSink extends BatchSink<StructuredRecord, NullWritable,
     config.validate(collector);
     collector.getOrThrowException();
 
-    FileFormat format = config.getFormat();
+    String format = config.getFormatName();
     // add schema as a macro since we don't know it until runtime
     PluginProperties.Builder formatPropertiesBuilder = PluginProperties.builder()
       .addAll(config.getProperties().getProperties());
@@ -86,38 +93,39 @@ public class GCSMultiBatchSink extends BatchSink<StructuredRecord, NullWritable,
     PluginProperties formatProperties = formatPropertiesBuilder.build();
 
     OutputFormatProvider outputFormatProvider =
-      pipelineConfigurer.usePlugin(ValidatingOutputFormat.PLUGIN_TYPE, format.name().toLowerCase(),
-                                   FORMAT_PLUGIN_ID, formatProperties);
+      pipelineConfigurer.usePlugin(ValidatingOutputFormat.PLUGIN_TYPE, format, FORMAT_PLUGIN_ID, formatProperties);
     if (outputFormatProvider == null) {
       collector.addFailure(
-        String.format("Could not find the '%s' output format plugin.", format.name().toLowerCase()), null)
-        .withPluginNotFound(FORMAT_PLUGIN_ID, format.name().toLowerCase(), ValidatingOutputFormat.PLUGIN_TYPE);
+        String.format("Could not find the '%s' output format plugin.", format), null)
+        .withPluginNotFound(FORMAT_PLUGIN_ID, format, ValidatingOutputFormat.PLUGIN_TYPE);
     }
   }
 
   @Override
   public void prepareRun(BatchSinkContext context) throws IOException, InstantiationException {
     FailureCollector collector = context.getFailureCollector();
-    config.validate(collector);
+    config.validate(collector, context.getArguments().asMap());
     collector.getOrThrowException();
 
-    Map<String, String> baseProperties = GCPUtils.getFileSystemProperties(config, config.getPath(), new HashMap<>());
+    Map<String, String> baseProperties = GCPUtils.getFileSystemProperties(config.connection,
+                                                                          config.getPath(), new HashMap<>());
     Map<String, String> argumentCopy = new HashMap<>(context.getArguments().asMap());
 
-    String cmekKey = context.getArguments().get(GCPUtils.CMEK_KEY);
-    Boolean isServiceAccountFilePath = config.isServiceAccountFilePath();
+    CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(config.cmekKey, context.getArguments().asMap(), collector);
+    collector.getOrThrowException();
+    Boolean isServiceAccountFilePath = config.connection.isServiceAccountFilePath();
     if (isServiceAccountFilePath == null) {
       context.getFailureCollector().addFailure("Service account type is undefined.",
                                                "Must be `filePath` or `JSON`");
       context.getFailureCollector().getOrThrowException();
       return;
     }
-    Credentials credentials = config.getServiceAccount() == null ?
-      null : GCPUtils.loadServiceAccountCredentials(config.getServiceAccount(), isServiceAccountFilePath);
-    Storage storage = GCPUtils.getStorage(config.getProject(), credentials);
+    Credentials credentials = config.connection.getServiceAccount() == null ?
+      null : GCPUtils.loadServiceAccountCredentials(config.connection.getServiceAccount(), isServiceAccountFilePath);
+    Storage storage = GCPUtils.getStorage(config.connection.getProject(), credentials);
     try {
       if (storage.get(config.getBucket()) == null) {
-        GCPUtils.createBucket(storage, config.getBucket(), config.getLocation(), cmekKey);
+        GCPUtils.createBucket(storage, config.getBucket(), config.getLocation(), cmekKeyName);
       }
     } catch (StorageException e) {
       // Add more descriptive error message

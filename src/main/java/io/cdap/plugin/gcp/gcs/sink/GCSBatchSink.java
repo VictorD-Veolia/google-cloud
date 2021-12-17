@@ -17,6 +17,7 @@
 package io.cdap.plugin.gcp.gcs.sink;
 
 import com.google.auth.Credentials;
+import com.google.cloud.kms.v1.CryptoKeyName;
 import com.google.cloud.storage.Bucket;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageException;
@@ -26,23 +27,35 @@ import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
 import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
+import io.cdap.cdap.api.annotation.Metadata;
+import io.cdap.cdap.api.annotation.MetadataProperty;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.annotation.Plugin;
 import io.cdap.cdap.api.data.schema.Schema;
+import io.cdap.cdap.api.plugin.PluginConfig;
+import io.cdap.cdap.etl.api.Arguments;
 import io.cdap.cdap.etl.api.FailureCollector;
 import io.cdap.cdap.etl.api.PipelineConfigurer;
 import io.cdap.cdap.etl.api.StageMetrics;
 import io.cdap.cdap.etl.api.batch.BatchSink;
 import io.cdap.cdap.etl.api.batch.BatchSinkContext;
+import io.cdap.cdap.etl.api.connector.Connector;
 import io.cdap.cdap.etl.api.validation.ValidatingOutputFormat;
+import io.cdap.plugin.common.ConfigUtil;
+import io.cdap.plugin.common.Constants;
+import io.cdap.plugin.common.IdUtils;
 import io.cdap.plugin.common.LineageRecorder;
 import io.cdap.plugin.format.FileFormat;
 import io.cdap.plugin.format.plugin.AbstractFileSink;
 import io.cdap.plugin.format.plugin.FileSinkProperties;
+import io.cdap.plugin.gcp.common.CmekUtils;
+import io.cdap.plugin.gcp.common.GCPConnectorConfig;
 import io.cdap.plugin.gcp.common.GCPReferenceSinkConfig;
 import io.cdap.plugin.gcp.common.GCPUtils;
+import io.cdap.plugin.gcp.gcs.Formats;
 import io.cdap.plugin.gcp.gcs.GCSPath;
 import io.cdap.plugin.gcp.gcs.StorageClient;
+import io.cdap.plugin.gcp.gcs.connector.GCSConnector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -58,10 +71,12 @@ import javax.annotation.Nullable;
  * Writes data to files on Google Cloud Storage.
  */
 @Plugin(type = BatchSink.PLUGIN_TYPE)
-@Name("GCS")
+@Name(GCSBatchSink.NAME)
 @Description("Writes records to one or more files in a directory on Google Cloud Storage.")
+@Metadata(properties = {@MetadataProperty(key = Connector.PLUGIN_TYPE, value = GCSConnector.NAME)})
 public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConfig> {
 
+  public static final String NAME = "GCS";
   private static final Logger LOG = LoggerFactory.getLogger(GCSBatchSink.class);
   public static final String RECORD_COUNT = "recordcount";
   private static final String RECORDS_UPDATED_METRIC = "records.updated";
@@ -98,18 +113,20 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
   @Override
   public void prepareRun(BatchSinkContext context) throws Exception {
     super.prepareRun(context);
-    String cmekKey = context.getArguments().get(GCPUtils.CMEK_KEY);
+    FailureCollector collector = context.getFailureCollector();
+    CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(config.cmekKey, context.getArguments().asMap(), collector);
+    collector.getOrThrowException();
 
-    Boolean isServiceAccountFilePath = config.isServiceAccountFilePath();
+    Boolean isServiceAccountFilePath = config.connection.isServiceAccountFilePath();
     if (isServiceAccountFilePath == null) {
-      context.getFailureCollector().addFailure("Service account type is undefined.",
+      collector.addFailure("Service account type is undefined.",
                                                "Must be `filePath` or `JSON`");
-      context.getFailureCollector().getOrThrowException();
+      collector.getOrThrowException();
       return;
     }
-    Credentials credentials = config.getServiceAccount() == null ?
-      null : GCPUtils.loadServiceAccountCredentials(config.getServiceAccount(), isServiceAccountFilePath);
-    Storage storage = GCPUtils.getStorage(config.getProject(), credentials);
+    Credentials credentials = config.connection.getServiceAccount() == null ?
+      null : GCPUtils.loadServiceAccountCredentials(config.connection.getServiceAccount(), isServiceAccountFilePath);
+    Storage storage = GCPUtils.getStorage(config.connection.getProject(), credentials);
     Bucket bucket;
     try {
       bucket = storage.get(config.getBucket());
@@ -119,13 +136,14 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
           + "Ensure you entered the correct bucket path and have permissions for it.", e);
     }
     if (bucket == null) {
-      GCPUtils.createBucket(storage, config.getBucket(), config.getLocation(), cmekKey);
+      GCPUtils.createBucket(storage, config.getBucket(), config.getLocation(), cmekKeyName);
     }
   }
 
   @Override
   protected Map<String, String> getFileSystemProperties(BatchSinkContext context) {
-    Map<String, String> properties = GCPUtils.getFileSystemProperties(config, config.getPath(), new HashMap<>());
+    Map<String, String> properties = GCPUtils.getFileSystemProperties(config.connection, config.getPath(),
+                                                                      new HashMap<>());
     properties.put(GCSBatchSink.CONTENT_TYPE, config.getContentType());
     properties.putAll(config.getFileSystemProperties());
     String outputFileBaseName = config.getOutputFileNameBase();
@@ -161,8 +179,7 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
     }
 
     try {
-      StorageClient storageClient = StorageClient.create(config.getProject(), config.getServiceAccount(),
-                                                         config.isServiceAccountFilePath());
+      StorageClient storageClient = StorageClient.create(config.connection);
       storageClient.mapMetaDataForAllBlobs(getPrefixPath(), new MetricsEmitter(context.getMetrics())::emitMetrics);
     } catch (Exception e) {
       LOG.warn("Metrics for the number of affected rows in GCS Sink maybe incorrect.", e);
@@ -190,7 +207,8 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
     }
 
     Map<String, String> fileSystemProperties = config.getFileSystemProperties();
-    if (fileSystemProperties.containsKey(AVRO_NAMED_OUTPUT) && config.getFormat() == FileFormat.AVRO) {
+    if (fileSystemProperties.containsKey(AVRO_NAMED_OUTPUT) &&
+      FileFormat.AVRO.name().toLowerCase().equals(config.getFormatName())) {
       return fileSystemProperties.get(AVRO_NAMED_OUTPUT);
     }
     if (fileSystemProperties.containsKey(COMMON_NAMED_OUTPUT)) {
@@ -236,8 +254,8 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
    * Sink configuration.
    */
   @SuppressWarnings("unused")
-  public static class GCSBatchSinkConfig extends GCPReferenceSinkConfig implements FileSinkProperties {
-    private static final String NAME_PATH = "path";
+  public static class GCSBatchSinkConfig extends PluginConfig implements FileSinkProperties {
+    public static final String NAME_PATH = "path";
     private static final String NAME_SUFFIX = "suffix";
     private static final String NAME_FORMAT = "format";
     private static final String NAME_SCHEMA = "schema";
@@ -261,6 +279,7 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
     private static final String FORMAT_DELIMITED = "delimited";
     private static final String FORMAT_ORC = "orc";
     private static final String FORMAT_PARQUET = "parquet";
+    public static final String NAME_CMEK_KEY = "cmekKey";
 
     private static final String SCHEME = "gs://";
     @Name(NAME_PATH)
@@ -329,6 +348,28 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
     @Description("Advanced feature to specify file output name prefix.")
     private String outputFileNameBase;
 
+    @Name(NAME_CMEK_KEY)
+    @Macro
+    @Nullable
+    @Description("The GCP customer managed encryption key (CMEK) name used to encrypt data written to " +
+      "any bucket created by the plugin. If the bucket already exists, this is ignored.")
+    protected String cmekKey;
+
+    @Name(Constants.Reference.REFERENCE_NAME)
+    @Description("This will be used to uniquely identify this source for lineage, annotating metadata, etc.")
+    public String referenceName;
+
+    @Name(ConfigUtil.NAME_USE_CONNECTION)
+    @Nullable
+    @Description("Whether to use an existing connection.")
+    private Boolean useConnection;
+
+    @Name(ConfigUtil.NAME_CONNECTION)
+    @Macro
+    @Nullable
+    @Description("The existing connection to use.")
+    protected GCPConnectorConfig connection;
+
     @Override
     public void validate() {
       // no-op
@@ -336,7 +377,13 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
 
     @Override
     public void validate(FailureCollector collector) {
-      super.validate(collector);
+      validate(collector, Collections.emptyMap());
+    }
+
+    @Override
+    public void validate(FailureCollector collector, Map<String, String> arguments) {
+      IdUtils.validateReferenceName(referenceName, collector);
+      ConfigUtil.validateConnection(this, useConnection, connection, collector);
       // validate that path is valid
       if (!containsMacro(NAME_PATH)) {
         try {
@@ -354,21 +401,16 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
         }
       }
 
-      if (!containsMacro(NAME_FORMAT)) {
-        try {
-          getFormat();
-        } catch (IllegalArgumentException e) {
-          collector.addFailure(e.getMessage(), null).withConfigProperty(NAME_FORMAT)
-            .withStacktrace(e.getStackTrace());
-        }
-      }
-
       if (!containsMacro(NAME_CONTENT_TYPE) && !containsMacro(NAME_CUSTOM_CONTENT_TYPE)
         && !Strings.isNullOrEmpty(contentType) && !contentType.equalsIgnoreCase(CONTENT_TYPE_OTHER)
         && !containsMacro(NAME_FORMAT)) {
         if (!contentType.equalsIgnoreCase(DEFAULT_CONTENT_TYPE)) {
           validateContentType(collector);
         }
+      }
+
+      if (!containsMacro(NAME_CMEK_KEY)) {
+        validateCmekKey(collector, arguments);
       }
 
       try {
@@ -384,6 +426,29 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
         collector.addFailure("File system properties must be a valid json.", null)
           .withConfigProperty(NAME_FS_PROPERTIES).withStacktrace(e.getStackTrace());
       }
+    }
+
+    @Override
+    public String getReferenceName() {
+      return referenceName;
+    }
+
+    public GCSBatchSinkConfig(@Nullable String referenceName, @Nullable String project,
+                              @Nullable String fileSystemProperties, @Nullable String serviceAccountType,
+                              @Nullable String serviceFilePath, @Nullable String serviceAccountJson,
+                              @Nullable String path, @Nullable String location, @Nullable String cmekKey,
+                              @Nullable String format, @Nullable String contentType,
+                              @Nullable String customContentType) {
+      super();
+      this.referenceName = referenceName;
+      this.fileSystemProperties = fileSystemProperties;
+      this.connection = new GCPConnectorConfig(project, serviceAccountType, serviceFilePath, serviceAccountJson);
+      this.path = path;
+      this.location = location;
+      this.cmekKey = cmekKey;
+      this.format = format;
+      this.contentType = contentType;
+      this.customContentType = customContentType;
     }
 
     //This method validates the specified content type for the used format.
@@ -460,8 +525,8 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
     }
 
     @Override
-    public FileFormat getFormat() {
-      return FileFormat.from(format, FileFormat::canWrite);
+    public String getFormatName() {
+      return Formats.getFormatPluginName(format);
     }
 
     @Nullable
@@ -531,6 +596,127 @@ public class GCSBatchSink extends AbstractFileSink<GCSBatchSink.GCSBatchSinkConf
     @Nullable
     public String getOutputFileNameBase() {
       return outputFileNameBase;
+    }
+
+    public GCSBatchSinkConfig() {
+      super();
+    }
+
+    //This method validated the pattern of CMEK Key resource ID.
+    void validateCmekKey(FailureCollector failureCollector, Map<String, String> arguments) {
+      CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(cmekKey, arguments, failureCollector);
+
+      //these fields are needed to check if bucket exists or not and for location validation
+      if (cmekKeyName == null || containsMacro(NAME_PATH) || containsMacro(NAME_LOCATION) || connection == null
+        || !connection.canConnect()) {
+        return;
+      }
+
+      Storage storage = GCPUtils.getStorage(connection.getProject(), connection.getCredentials(failureCollector));
+      if (storage == null) {
+        return;
+      }
+      CmekUtils.validateCmekKeyAndBucketLocation(storage, GCSPath.from(path), cmekKeyName, location, failureCollector);
+    }
+
+    public static Builder builder() {
+      return new Builder();
+    }
+
+    /**
+     * GCS Batch Sink configuration builder.
+     */
+    public static class Builder {
+      private String referenceName;
+      private String serviceAccountType;
+      private String serviceFilePath;
+      private String serviceAccountJson;
+      private String fileSystemProperties;
+      private String project;
+      private String gcsPath;
+      private String cmekKey;
+      private String location;
+      private String format;
+      private String contentType;
+      private String customContentType;
+
+      public Builder setReferenceName(@Nullable String referenceName) {
+        this.referenceName = referenceName;
+        return this;
+      }
+
+      public Builder setProject(@Nullable String project) {
+        this.project = project;
+        return this;
+      }
+
+      public Builder setServiceAccountType(@Nullable String serviceAccountType) {
+        this.serviceAccountType = serviceAccountType;
+        return this;
+      }
+
+      public Builder setServiceFilePath(@Nullable String serviceFilePath) {
+        this.serviceFilePath = serviceFilePath;
+        return this;
+      }
+
+      public Builder setServiceAccountJson(@Nullable String serviceAccountJson) {
+        this.serviceAccountJson = serviceAccountJson;
+        return this;
+      }
+
+      public Builder setGcsPath(@Nullable String gcsPath) {
+        this.gcsPath = gcsPath;
+        return this;
+      }
+
+      public Builder setCmekKey(@Nullable String cmekKey) {
+        this.cmekKey = cmekKey;
+        return this;
+      }
+
+      public Builder setLocation(@Nullable String location) {
+        this.location = location;
+        return this;
+      }
+
+      public Builder setFileSystemProperties(@Nullable String fileSystemProperties) {
+        this.fileSystemProperties = fileSystemProperties;
+        return this;
+      }
+
+      public Builder setFormat(@Nullable String format) {
+        this.format = format;
+        return this;
+      }
+
+      public Builder setContentType(@Nullable String contentType) {
+        this.contentType = contentType;
+        return this;
+      }
+
+      public Builder setCustomContentType(@Nullable String customContentType) {
+        this.customContentType = customContentType;
+        return this;
+      }
+
+      public GCSBatchSink.GCSBatchSinkConfig build() {
+        return new GCSBatchSink.GCSBatchSinkConfig(
+          referenceName,
+          project,
+          fileSystemProperties,
+          serviceAccountType,
+          serviceFilePath,
+          serviceAccountJson,
+          gcsPath,
+          location,
+          cmekKey,
+          format,
+          contentType,
+          customContentType
+        );
+      }
+
     }
   }
 }

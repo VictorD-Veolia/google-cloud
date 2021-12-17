@@ -29,6 +29,7 @@ import com.google.api.services.bigquery.model.ErrorProto;
 import com.google.api.services.bigquery.model.Job;
 import com.google.api.services.bigquery.model.JobConfiguration;
 import com.google.api.services.bigquery.model.JobConfigurationLoad;
+import com.google.api.services.bigquery.model.JobConfigurationTableCopy;
 import com.google.api.services.bigquery.model.JobReference;
 import com.google.api.services.bigquery.model.RangePartitioning;
 import com.google.api.services.bigquery.model.RangePartitioning.Range;
@@ -61,6 +62,7 @@ import com.google.cloud.hadoop.util.ConfigurationUtil;
 import com.google.cloud.hadoop.util.ResilientOperation;
 import com.google.cloud.hadoop.util.RetryDeterminer;
 import com.google.common.base.Strings;
+import com.google.common.collect.Lists;
 import io.cdap.cdap.api.data.format.StructuredRecord;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryConstants;
 import io.cdap.plugin.gcp.common.GCPUtils;
@@ -88,7 +90,6 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
-
 /**
  * An Output Format which extends {@link ForwardingBigQueryFileOutputFormat}.
  * This is added to override BigQueryUtils.waitForJobCompletion error message with more useful error message.
@@ -159,6 +160,9 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
     private String partitionFilter;
 
     private boolean allowSchemaRelaxation;
+    private boolean allowSchemaRelaxationOnEmptyOutput;
+
+    private static final int BQ_IMPORT_MAX_BATCH_SIZE = 10000;
 
     BigQueryOutputCommitter(TaskAttemptContext context, OutputCommitter delegate) throws IOException {
       super(context, delegate);
@@ -179,7 +183,7 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
       // Get the destination configuration information.
       Configuration conf = jobContext.getConfiguration();
       TableReference destTable = getTableReference(conf);
-      String destProjectId = BigQueryOutputConfiguration.getProjectId(conf);
+      String destProjectId = BigQueryOutputConfiguration.getJobProjectId(conf);
       String writeDisposition = BigQueryOutputConfiguration.getWriteDisposition(conf);
       Optional<TableSchema> destSchema = getTableSchema(conf);
       String kmsKeyName = BigQueryOutputConfiguration.getKmsKeyName(conf);
@@ -187,6 +191,8 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
       List<String> sourceUris = getOutputFileURIs();
 
       allowSchemaRelaxation = conf.getBoolean(BigQueryConstants.CONFIG_ALLOW_SCHEMA_RELAXATION, false);
+      allowSchemaRelaxationOnEmptyOutput =
+        conf.getBoolean(BigQueryConstants.CONFIG_ALLOW_SCHEMA_RELAXATION_ON_EMPTY_OUTPUT, false);
       LOG.debug("Allow schema relaxation: '{}'", allowSchemaRelaxation);
       PartitionType partitionType = conf.getEnum(BigQueryConstants.CONFIG_PARTITION_TYPE, PartitionType.NONE);
       LOG.debug("Create Partitioned Table type: '{}'", partitionType);
@@ -216,10 +222,7 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
       try {
         importFromGcs(destProjectId, destTable, destSchema.orElse(null), kmsKeyName, outputFileFormat,
                       writeDisposition, sourceUris, partitionType, range, partitionByField,
-                      requirePartitionFilter, clusteringOrderList, tableExists, getJobIdForImportGCS(conf));
-        if (temporaryTableReference != null) {
-          operationAction(destTable, kmsKeyName, getJobIdForUpdateUpsert(conf), conf);
-        }
+                      requirePartitionFilter, clusteringOrderList, tableExists, conf);
       } catch (Exception e) {
         throw new IOException("Failed to import GCS into BigQuery. ", e);
       }
@@ -264,12 +267,13 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
                                @Nullable String kmsKeyName, BigQueryFileFormat sourceFormat, String writeDisposition,
                                List<String> gcsPaths, PartitionType partitionType, @Nullable Range range,
                                @Nullable String partitionByField, boolean requirePartitionFilter,
-                               List<String> clusteringOrderList, boolean tableExists, String jobId)
+                               List<String> clusteringOrderList, boolean tableExists, Configuration conf)
       throws IOException, InterruptedException {
       LOG.info("Importing into table '{}' from {} paths; path[0] is '{}'; awaitCompletion: {}",
                BigQueryStrings.toString(tableRef), gcsPaths.size(), gcsPaths.isEmpty() ? "(empty)" : gcsPaths.get(0),
                true);
 
+      String jobId = getJobIdForImportGCS(conf);
       if (gcsPaths.isEmpty()) {
         if (!bigQueryHelper.tableExists(tableRef)) {
           // If gcsPaths empty and destination table not exist - creating empty destination table.
@@ -278,11 +282,21 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
           table.setTableReference(tableRef);
           bigQueryHelper.getRawBigquery().tables().insert(tableRef.getProjectId(), tableRef.getDatasetId(), table)
             .execute();
+        } else if (allowSchemaRelaxationOnEmptyOutput) {
+          // If the table requires a schema update, apply if even when there are no records to write.
+          Table table = bigQueryHelper.getTable(tableRef);
+          table.setSchema(schema);
+          bigQueryHelper.getRawBigquery().tables()
+            .update(tableRef.getProjectId(), tableRef.getDatasetId(), tableRef.getTableId(), table)
+            .execute();
         }
         return;
       }
       // Create load conf with minimal requirements.
       JobConfigurationLoad loadConfig = new JobConfigurationLoad();
+      loadConfig.setSourceFormat(sourceFormat.getFormatIdentifier());
+      loadConfig.setUseAvroLogicalTypes(true);
+
       // If schema change is not allowed and if the destination table already exists, use the destination table schema
       // See PLUGIN-395
       if (!allowSchemaRelaxation && tableExists) {
@@ -290,10 +304,6 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
       } else {
         loadConfig.setSchema(schema);
       }
-      loadConfig.setSourceFormat(sourceFormat.getFormatIdentifier());
-      loadConfig.setSourceUris(gcsPaths);
-      loadConfig.setWriteDisposition(writeDisposition);
-      loadConfig.setUseAvroLogicalTypes(true);
 
       Map<String, String> fieldDescriptions = new HashMap<>();
       if (JobInfo.WriteDisposition.WRITE_TRUNCATE
@@ -335,29 +345,12 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
         }
       }
 
-      temporaryTableReference = null;
-      if (!Operation.INSERT.equals(operation)) {
-        String temporaryTableName = tableRef.getTableId() + "_"
-          + UUID.randomUUID().toString().replaceAll("-", "_");
-        temporaryTableReference = new TableReference()
-          .setDatasetId(tableRef.getDatasetId())
-          .setProjectId(tableRef.getProjectId())
-          .setTableId(temporaryTableName);
-        loadConfig.setDestinationTable(temporaryTableReference);
+      if (!tableExists && Operation.UPSERT.equals(operation)) {
+        // If the table does not exist then an UPSERT operation becomes an INSERT operation
+        operation = Operation.INSERT;
+      }
 
-        if (!tableExists) {
-          if (Operation.UPSERT.equals(operation)) {
-            // For upsert operation, if the destination table does not exist, create it
-            Table table = new Table();
-            table.setTableReference(tableRef);
-            table.setSchema(schema);
-            bigQueryHelper.getRawBigquery().tables().insert(tableRef.getProjectId(), tableRef.getDatasetId(), table)
-              .execute();
-          }
-        }
-      } else {
-        loadConfig.setDestinationTable(tableRef);
-
+      if (Operation.INSERT.equals(operation)) {
         // Schema update options should only be specified with WRITE_APPEND disposition,
         // or with WRITE_TRUNCATE disposition on a table partition - The logic below should change when we support
         // insertion into single partition
@@ -381,57 +374,95 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
         LOG.info("Using schema '{}' for the load job config.", loadConfig.getSchema());
       }
 
-      JobConfiguration config = new JobConfiguration();
-      config.setLoad(loadConfig);
-
       // Get the dataset to determine the location
       Dataset dataset =
         bigQueryHelper.getRawBigquery().datasets().get(tableRef.getProjectId(), tableRef.getDatasetId()).execute();
+
+      //Depending on Operation type and no of gcs paths present , trigger suitable BQ job.
+      temporaryTableReference = null;
+      if (operation.equals(Operation.INSERT) &&  gcsPaths.size() <= BQ_IMPORT_MAX_BATCH_SIZE) {
+        // Directly load data into destination table when total no of input paths is loadable into BQ
+        loadConfig.setSourceUris(gcsPaths);
+        loadConfig.setWriteDisposition(writeDisposition);
+        loadConfig.setDestinationTable(tableRef);
+
+        JobConfiguration config = new JobConfiguration();
+        config.setLoad(loadConfig);
+        triggerBigqueryJob(projectId, jobId , dataset, config);
+      } else {
+        // First load the data in a temp table.
+        loadInBatchesInTempTable(tableRef, loadConfig, gcsPaths, projectId, jobId, dataset);
+
+        if (operation.equals(Operation.INSERT)) { // For the case when gcs paths is more than 10000
+          handleInsertOperation(tableRef, writeDisposition, loadConfig.getDestinationEncryptionConfiguration(),
+                                projectId, jobId, dataset, tableExists);
+        } else {
+          handleUpdateUpsertOperation(tableRef, kmsKeyName, getJobIdForUpdateUpsert(conf), conf);
+        }
+      }
+
+      setTemporaryTableExpiration();
+      updateFieldDescriptions(writeDisposition, tableRef, fieldDescriptions);
+
+      LOG.info("Imported into table '{}' from {} paths; path[0] is '{}'",
+               BigQueryStrings.toString(tableRef), gcsPaths.size(), gcsPaths.isEmpty() ? "(empty)" : gcsPaths.get(0));
+    }
+
+    private void triggerBigqueryJob(String projectId, String jobId, Dataset dataset, JobConfiguration jobConfiguration)
+      throws IOException, InterruptedException {
 
       JobReference jobReference =
         new JobReference().setProjectId(projectId)
           .setJobId(jobId)
           .setLocation(dataset.getLocation());
-      Job job = new Job();
-      job.setConfiguration(config);
-      job.setJobReference(jobReference);
 
+      Job job = new Job();
+      job.setConfiguration(jobConfiguration);
+      job.setJobReference(jobReference);
       // Insert and run job.
       bigQueryHelper.insertJobOrFetchDuplicate(projectId, job);
-
       // Poll until job is complete.
       waitForJobCompletion(bigQueryHelper.getRawBigquery(), projectId, jobReference);
+    }
 
+    private void loadInBatchesInTempTable(TableReference tableRef, JobConfigurationLoad loadConfig,
+                                          List<String> gcsPaths, String projectId, String jobId, Dataset dataset)
+      throws IOException, InterruptedException {
+
+      LOG.info(" Importing into a temporary table first in batches of 10000");
+
+      String temporaryTableName = tableRef.getTableId() + "_"
+        + UUID.randomUUID().toString().replaceAll("-", "_");
+      temporaryTableReference = new TableReference()
+        .setDatasetId(tableRef.getDatasetId())
+        .setProjectId(tableRef.getProjectId())
+        .setTableId(temporaryTableName);
+
+      loadConfig.setDestinationTable(temporaryTableReference);
+      loadConfig.setWriteDisposition(JobInfo.WriteDisposition.WRITE_APPEND.toString());
+
+      // Split the list of files in batches 10000 (current bq load job limit) and import /append onto a temp table
+      List<List<String>> gcsPathsInBatches = Lists.partition(gcsPaths, BQ_IMPORT_MAX_BATCH_SIZE);
+
+      int jobcount = 1;
+      for (List<String> gcsPathBatch :  gcsPathsInBatches) {
+        LOG.debug(" Running for Batch {} with number of gcs paths : {}", jobcount, gcsPathBatch.size());
+        loadConfig.setSourceUris(gcsPathBatch);
+        JobConfiguration config = new JobConfiguration();
+        config.setLoad(loadConfig);
+
+        triggerBigqueryJob(projectId, jobId + "_" + jobcount, dataset, config);
+        jobcount++;
+      }
+    }
+
+    private void setTemporaryTableExpiration() throws IOException {
       if (temporaryTableReference != null && bigQueryHelper.tableExists(temporaryTableReference)) {
         long expirationMillis = System.currentTimeMillis() + TimeUnit.DAYS.toMillis(1);
         Table table = bigQueryHelper.getTable(temporaryTableReference).setExpirationTime(expirationMillis);
         bigQueryHelper.getRawBigquery().tables().update(temporaryTableReference.getProjectId(),
                                                         temporaryTableReference.getDatasetId(),
                                                         temporaryTableReference.getTableId(), table).execute();
-      }
-
-      if (JobInfo.WriteDisposition.WRITE_TRUNCATE
-        .equals(JobInfo.WriteDisposition.valueOf(writeDisposition))) {
-
-        Table table = bigQueryHelper.getTable(tableRef);
-        List<TableFieldSchema> tableFieldSchemas = Optional.ofNullable(table)
-          .map(Table::getSchema)
-          .map(TableSchema::getFields)
-          .orElse(Collections.emptyList());
-
-        tableFieldSchemas
-          .forEach(it -> {
-            Optional.ofNullable(fieldDescriptions.get(it.getName()))
-              .ifPresent(it::setDescription);
-          });
-
-        bigQueryHelper
-          .getRawBigquery()
-          .tables()
-          .update(tableRef.getProjectId(),
-                  tableRef.getDatasetId(),
-                  tableRef.getTableId(), table)
-          .execute();
       }
     }
 
@@ -539,8 +570,25 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
       return Optional.empty();
     }
 
-    private void operationAction(TableReference tableRef, @Nullable String cmekKey, JobId jobId, Configuration config)
-      throws Exception {
+    private void handleInsertOperation(TableReference tableRef, String writeDisposition,
+                                       EncryptionConfiguration encryptionConfiguration, String projectId, String jobId,
+                                       Dataset dataset, boolean tableExists) throws IOException, InterruptedException {
+      if (allowSchemaRelaxation && tableExists) {
+        updateTableSchema(tableRef);
+      }
+      JobConfigurationTableCopy tableCopyConfig = new JobConfigurationTableCopy();
+      tableCopyConfig.setDestinationTable(tableRef);
+      tableCopyConfig.setSourceTable(temporaryTableReference);
+      tableCopyConfig.setWriteDisposition(writeDisposition);
+      tableCopyConfig.setDestinationEncryptionConfiguration(encryptionConfiguration);
+
+      JobConfiguration config = new JobConfiguration();
+      config.setCopy(tableCopyConfig);
+      triggerBigqueryJob(projectId, jobId, dataset, config);
+    }
+
+    private void handleUpdateUpsertOperation(TableReference tableRef, @Nullable String cmekKey, JobId jobId,
+                                             Configuration config) throws IOException, InterruptedException {
       if (allowSchemaRelaxation) {
         updateTableSchema(tableRef);
       }
@@ -609,7 +657,7 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
       String criteria = tableKeyList.stream().map(s -> String.format(criteriaTemplate, s, s))
         .collect(Collectors.joining(" AND "));
       criteria = partitionFilter != null ? String.format("(%s) AND %s",
-              formatPartitionFilter(partitionFilter), criteria) : criteria;
+                                                         formatPartitionFilter(partitionFilter), criteria) : criteria;
       String fieldsForUpdate = tableFieldsList.stream().filter(s -> !tableKeyList.contains(s))
         .map(s -> String.format(criteriaTemplate, s, s)).collect(Collectors.joining(", "));
       String orderedBy = orderedByList.isEmpty() ? "" : " ORDER BY " + String.join(", ", orderedByList);
@@ -623,7 +671,7 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
         case UPSERT:
           String insertFields = String.join(", ", tableFieldsList);
           return String.format(UPSERT_QUERY, destinationTable, sourceTable, criteria, fieldsForUpdate,
-                                insertFields, insertFields);
+                               insertFields, insertFields);
         default:
           return "";
       }
@@ -634,6 +682,33 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
       JsonParser parser = JacksonFactory.getDefaultInstance().createJsonParser(fieldsJson);
       parser.parseArrayAndClose(fields, TableFieldSchema.class);
       return new TableSchema().setFields(fields);
+    }
+
+    private void updateFieldDescriptions(String writeDisposition, TableReference tableRef,
+                                         Map<String, String> fieldDescriptions) throws IOException {
+      if (JobInfo.WriteDisposition.WRITE_TRUNCATE
+        .equals(JobInfo.WriteDisposition.valueOf(writeDisposition))) {
+
+        Table table = bigQueryHelper.getTable(tableRef);
+        List<TableFieldSchema> tableFieldSchemas = Optional.ofNullable(table)
+          .map(Table::getSchema)
+          .map(TableSchema::getFields)
+          .orElse(Collections.emptyList());
+
+        tableFieldSchemas
+          .forEach(it -> {
+            Optional.ofNullable(fieldDescriptions.get(it.getName()))
+              .ifPresent(it::setDescription);
+          });
+
+        bigQueryHelper
+          .getRawBigquery()
+          .tables()
+          .update(tableRef.getProjectId(),
+                  tableRef.getDatasetId(),
+                  tableRef.getTableId(), table)
+          .execute();
+      }
     }
 
     @Override
@@ -654,7 +729,7 @@ public class BigQueryOutputFormat extends ForwardingBigQueryFileOutputFormat<Str
       for (String word: queryWords) {
         if (COMPARISON_OPERATORS.contains(word.toUpperCase())) {
           queryWords[index - 1] = queryWords[index - 1].replace(queryWords[index - 1],
-                  "T." + queryWords[index - 1]);
+                                                                "T." + queryWords[index - 1]);
         }
         index++;
       }

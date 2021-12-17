@@ -16,13 +16,24 @@
 
 package io.cdap.plugin.gcp.gcs.actions;
 
+import com.google.api.pathtemplate.ValidationException;
+import com.google.auth.Credentials;
+import com.google.cloud.kms.v1.CryptoKeyName;
+import com.google.cloud.storage.Bucket;
+import com.google.cloud.storage.Storage;
+import com.google.cloud.storage.StorageException;
+import com.google.common.base.Strings;
 import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.etl.api.FailureCollector;
+import io.cdap.plugin.gcp.common.CmekUtils;
 import io.cdap.plugin.gcp.common.GCPConfig;
+import io.cdap.plugin.gcp.common.GCPUtils;
 import io.cdap.plugin.gcp.gcs.GCSPath;
 
+import java.util.Collections;
+import java.util.Map;
 import javax.annotation.Nullable;
 
 /**
@@ -31,6 +42,7 @@ import javax.annotation.Nullable;
 public class SourceDestConfig extends GCPConfig {
   public static final String NAME_SOURCE_PATH = "sourcePath";
   public static final String NAME_DEST_PATH = "destPath";
+  public static final String NAME_LOCATION = "location";
 
   @Name(NAME_SOURCE_PATH)
   @Macro
@@ -39,13 +51,39 @@ public class SourceDestConfig extends GCPConfig {
 
   @Name(NAME_DEST_PATH)
   @Macro
-  @Description("Path to the destination. The bucket must already exist.")
+  @Description("Path to the destination. The bucket will be created if it does not exist.")
   private String destPath;
 
   @Macro
   @Nullable
   @Description("Whether to overwrite existing objects.")
   private Boolean overwrite;
+
+  @Name(NAME_LOCATION)
+  @Macro
+  @Nullable
+  @Description("The location where the GCS bucket will get created. " +
+    "This value is ignored if the bucket already exists.")
+  protected String location;
+
+  @Name(NAME_CMEK_KEY)
+  @Macro
+  @Nullable
+  @Description("The GCP customer managed encryption key (CMEK) name used to encrypt data written to " +
+    "any bucket created by the plugin. If the bucket already exists, this is ignored.")
+  protected String cmekKey;
+
+  public SourceDestConfig(@Nullable String project, @Nullable String serviceAccountType,
+                          @Nullable String serviceFilePath, @Nullable String serviceAccountJson,
+                          @Nullable String destPath, @Nullable String location, @Nullable String cmekKey) {
+    this.serviceAccountType = serviceAccountType;
+    this.serviceAccountJson = serviceAccountJson;
+    this.serviceFilePath = serviceFilePath;
+    this.project = project;
+    this.destPath = destPath;
+    this.location = location;
+    this.cmekKey = cmekKey;
+  }
 
   public SourceDestConfig() {
     overwrite = false;
@@ -65,6 +103,10 @@ public class SourceDestConfig extends GCPConfig {
   }
 
   public void validate(FailureCollector collector) {
+    validate(collector, Collections.emptyMap());
+  }
+  
+  public void validate(FailureCollector collector, Map<String, String> arguments) {
     if (!containsMacro("sourcePath")) {
       try {
         getSourcePath();
@@ -79,6 +121,91 @@ public class SourceDestConfig extends GCPConfig {
         collector.addFailure(e.getMessage(), null).withConfigProperty(NAME_DEST_PATH);
       }
     }
+    if (!containsMacro(NAME_CMEK_KEY)) {
+      validateCmekKey(collector, arguments);
+    }
     collector.getOrThrowException();
+  }
+
+  //This method validated the pattern of CMEK Key resource ID.
+  void validateCmekKey(FailureCollector failureCollector, Map<String, String> arguments) {
+    CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(cmekKey, arguments, failureCollector);
+
+    //these fields are needed to check if bucket exists or not and for location validation
+    if (cmekKeyName == null || containsMacro(NAME_DEST_PATH) || containsMacro(NAME_LOCATION) ||
+      projectOrServiceAccountContainsMacro()) {
+      return;
+    }
+    
+    Storage storage = GCPUtils.getStorage(getProject(), getCredentials(failureCollector));
+    if (storage == null) {
+      return;
+    }
+    CmekUtils.validateCmekKeyAndBucketLocation(storage, GCSPath.from(destPath),
+                                               cmekKeyName, location, failureCollector);
+  }
+
+  public static SourceDestConfig.Builder builder() {
+    return new SourceDestConfig.Builder();
+  }
+
+  /**
+   * SourceDest configuration builder.
+   */
+  public static class Builder {
+    private String serviceAccountType;
+    private String serviceFilePath;
+    private String serviceAccountJson;
+    private String project;
+    private String destPath;
+    private String cmekKey;
+    private String location;
+
+    public SourceDestConfig.Builder setProject(@Nullable String project) {
+      this.project = project;
+      return this;
+    }
+
+    public SourceDestConfig.Builder setServiceAccountType(@Nullable String serviceAccountType) {
+      this.serviceAccountType = serviceAccountType;
+      return this;
+    }
+
+    public SourceDestConfig.Builder setServiceFilePath(@Nullable String serviceFilePath) {
+      this.serviceFilePath = serviceFilePath;
+      return this;
+    }
+
+    public SourceDestConfig.Builder setServiceAccountJson(@Nullable String serviceAccountJson) {
+      this.serviceAccountJson = serviceAccountJson;
+      return this;
+    }
+
+    public SourceDestConfig.Builder setGcsPath(@Nullable String destPath) {
+      this.destPath = destPath;
+      return this;
+    }
+
+    public SourceDestConfig.Builder setCmekKey(@Nullable String cmekKey) {
+      this.cmekKey = cmekKey;
+      return this;
+    }
+
+    public SourceDestConfig.Builder setLocation(@Nullable String location) {
+      this.location = location;
+      return this;
+    }
+
+    public SourceDestConfig build() {
+      return new SourceDestConfig(
+        project,
+        serviceAccountType,
+        serviceFilePath,
+        serviceAccountJson,
+        destPath,
+        location,
+        cmekKey
+      );
+    }
   }
 }

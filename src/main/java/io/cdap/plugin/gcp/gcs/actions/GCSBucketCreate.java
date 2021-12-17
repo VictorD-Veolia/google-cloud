@@ -16,21 +16,29 @@
 
 package io.cdap.plugin.gcp.gcs.actions;
 
+import com.google.api.pathtemplate.ValidationException;
+import com.google.auth.Credentials;
 import com.google.auth.oauth2.ServiceAccountCredentials;
+import com.google.cloud.kms.v1.CryptoKeyName;
 import com.google.cloud.storage.Bucket;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageException;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Strings;
 import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.annotation.Plugin;
+import io.cdap.cdap.etl.api.Arguments;
 import io.cdap.cdap.etl.api.FailureCollector;
 import io.cdap.cdap.etl.api.PipelineConfigurer;
 import io.cdap.cdap.etl.api.action.Action;
 import io.cdap.cdap.etl.api.action.ActionContext;
+import io.cdap.plugin.gcp.common.CmekUtils;
 import io.cdap.plugin.gcp.common.GCPConfig;
 import io.cdap.plugin.gcp.common.GCPUtils;
 import io.cdap.plugin.gcp.gcs.GCSPath;
+import io.cdap.plugin.gcp.gcs.sink.GCSBatchSink;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -40,6 +48,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -64,15 +73,16 @@ public final class GCSBucketCreate extends Action {
 
   @Override
   public void run(ActionContext context) throws Exception {
-    config.validate(context.getFailureCollector());
+    FailureCollector collector = context.getFailureCollector();
+    config.validate(collector, context.getArguments().asMap());
 
     Configuration configuration = new Configuration();
 
     Boolean isServiceAccountFilePath = config.isServiceAccountFilePath();
     if (isServiceAccountFilePath == null) {
-      context.getFailureCollector().addFailure("Service account type is undefined.",
-                                               "Must be `filePath` or `JSON`");
-      context.getFailureCollector().getOrThrowException();
+      collector.addFailure("Service account type is undefined.",
+                           "Must be `filePath` or `JSON`");
+      collector.getOrThrowException();
       return;
     }
     String serviceAccount = config.getServiceAccount();
@@ -103,6 +113,8 @@ public final class GCSBucketCreate extends Action {
     Storage storage = GCPUtils.getStorage(config.getProject(), credentials);
     boolean rollback = false;
     try {
+      CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(config.cmekKey, context.getArguments().asMap(), collector);
+      collector.getOrThrowException();
       for (String path : config.getPaths()) {
         GCSPath gcsPath = GCSPath.from(path);
         GCSPath bucketPath = GCSPath.from(GCSPath.SCHEME + gcsPath.getBucket());
@@ -123,8 +135,7 @@ public final class GCSBucketCreate extends Action {
               + "Ensure you entered the correct bucket path and have permissions for it.", e);
         }
         if (bucket == null) {
-          GCPUtils.createBucket(storage, gcsPath.getBucket(), config.location,
-                                context.getArguments().get(GCPUtils.CMEK_KEY));
+          GCPUtils.createBucket(storage, gcsPath.getBucket(), config.location, cmekKeyName);
           undoBucket.add(bucketPath);
         } else if (gcsPath.equals(bucketPath) && config.failIfExists()) {
           // if the gcs path is just a bucket, and it exists, fail the pipeline
@@ -201,8 +212,27 @@ public final class GCSBucketCreate extends Action {
     @Macro
     @Nullable
     @Description("The location where the gcs buckets will get created. " +
-                   "This value is ignored if the bucket already exists.")
+      "This value is ignored if the bucket already exists.")
     protected String location;
+
+    @Name(NAME_CMEK_KEY)
+    @Macro
+    @Nullable
+    @Description("The GCP customer managed encryption key (CMEK) name used to encrypt data written to " +
+      "any bucket created by the plugin. If the bucket already exists, this is ignored.")
+    private String cmekKey;
+
+    public Config(@Nullable String project, @Nullable String serviceAccountType, @Nullable String serviceFilePath,
+                  @Nullable String serviceAccountJson, @Nullable String paths, @Nullable String location,
+                  @Nullable String cmekKey) {
+      this.serviceAccountType = serviceAccountType;
+      this.serviceAccountJson = serviceAccountJson;
+      this.serviceFilePath = serviceFilePath;
+      this.project = project;
+      this.paths = paths;
+      this.location = location;
+      this.cmekKey = cmekKey;
+    }
 
     public List<String> getPaths() {
       return Arrays.stream(paths.split(",")).map(String::trim).collect(Collectors.toList());
@@ -211,8 +241,11 @@ public final class GCSBucketCreate extends Action {
     public boolean failIfExists() {
       return failIfExists;
     }
-
     void validate(FailureCollector collector) {
+      validate(collector, Collections.emptyMap());
+    }
+    
+    void validate(FailureCollector collector, Map<String, String> arguments) {
       if (!containsMacro("paths")) {
         for (String path : getPaths()) {
           try {
@@ -221,7 +254,93 @@ public final class GCSBucketCreate extends Action {
             collector.addFailure(e.getMessage(), null).withConfigElement(NAME_PATHS, path);
           }
         }
-        collector.getOrThrowException();
+      }
+      if (!containsMacro(NAME_CMEK_KEY)) {
+        validateCmekKey(collector, arguments);
+      }
+      collector.getOrThrowException();
+    }
+
+    //This method validated the pattern of CMEK Key resource ID.
+    void validateCmekKey(FailureCollector failureCollector, Map<String, String> arguments) {
+      CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(cmekKey, arguments, failureCollector);
+
+      //these fields are needed to check if bucket exists or not and for location validation
+      if (cmekKeyName == null || containsMacro(NAME_PATHS) || containsMacro(NAME_LOCATION) ||
+        projectOrServiceAccountContainsMacro()) {
+        return;
+      }
+      Storage storage = GCPUtils.getStorage(getProject(), getCredentials(failureCollector));
+      if (storage == null) {
+        return;
+      }
+      for (String path : getPaths()) {
+        CmekUtils.validateCmekKeyAndBucketLocation(storage, GCSPath.from(path),
+                                                   cmekKeyName, location, failureCollector);
+      }
+    }
+
+    public static Config.Builder builder() {
+      return new Config.Builder();
+    }
+
+    /**
+     * GCS Bucket Create configuration builder.
+     */
+    public static class Builder {
+      private String serviceAccountType;
+      private String serviceFilePath;
+      private String serviceAccountJson;
+      private String project;
+      private String gcsPaths;
+      private String cmekKey;
+      private String location;
+
+      public GCSBucketCreate.Config.Builder setProject(@Nullable String project) {
+        this.project = project;
+        return this;
+      }
+
+      public GCSBucketCreate.Config.Builder setServiceAccountType(@Nullable String serviceAccountType) {
+        this.serviceAccountType = serviceAccountType;
+        return this;
+      }
+
+      public GCSBucketCreate.Config.Builder setServiceFilePath(@Nullable String serviceFilePath) {
+        this.serviceFilePath = serviceFilePath;
+        return this;
+      }
+
+      public GCSBucketCreate.Config.Builder setServiceAccountJson(@Nullable String serviceAccountJson) {
+        this.serviceAccountJson = serviceAccountJson;
+        return this;
+      }
+
+      public GCSBucketCreate.Config.Builder setGcsPath(@Nullable String gcsPaths) {
+        this.gcsPaths = gcsPaths;
+        return this;
+      }
+
+      public GCSBucketCreate.Config.Builder setCmekKey(@Nullable String cmekKey) {
+        this.cmekKey = cmekKey;
+        return this;
+      }
+
+      public GCSBucketCreate.Config.Builder setLocation(@Nullable String location) {
+        this.location = location;
+        return this;
+      }
+
+      public GCSBucketCreate.Config build() {
+        return new GCSBucketCreate.Config(
+          project,
+          serviceAccountType,
+          serviceFilePath,
+          serviceAccountJson,
+          gcsPaths,
+          location,
+          cmekKey
+        );
       }
     }
   }

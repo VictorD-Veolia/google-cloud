@@ -1,5 +1,6 @@
 package io.cdap.plugin.gcp.common;
 
+import com.google.auth.Credentials;
 import com.google.auth.oauth2.ServiceAccountCredentials;
 import com.google.cloud.ServiceOptions;
 import com.google.common.base.Strings;
@@ -7,6 +8,7 @@ import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.plugin.PluginConfig;
+import io.cdap.cdap.etl.api.FailureCollector;
 
 import java.io.IOException;
 import javax.annotation.Nullable;
@@ -22,6 +24,7 @@ public class GCPConfig extends PluginConfig {
   public static final String AUTO_DETECT = "auto-detect";
   public static final String SERVICE_ACCOUNT_FILE_PATH = "filePath";
   public static final String SERVICE_ACCOUNT_JSON = "JSON";
+  public static final String NAME_CMEK_KEY = "cmekKey";
 
   @Name(NAME_PROJECT)
   @Description("Google Cloud Project ID, which uniquely identifies a project. "
@@ -137,5 +140,22 @@ public class GCPConfig extends PluginConfig {
       }
     }
     return false;
+  }
+
+  public boolean projectOrServiceAccountContainsMacro() {
+    return containsMacro(NAME_PROJECT) || containsMacro(NAME_SERVICE_ACCOUNT_TYPE) ||
+      containsMacro(NAME_SERVICE_ACCOUNT_JSON) || containsMacro(NAME_SERVICE_ACCOUNT_FILE_PATH);
+  }
+
+  public Credentials getCredentials(FailureCollector collector) {
+    Boolean isServiceAccountFilePath = isServiceAccountFilePath();
+    Credentials credentials = null;
+    try {
+      credentials = getServiceAccount() == null ?
+        null : GCPUtils.loadServiceAccountCredentials(getServiceAccount(), isServiceAccountFilePath);
+    } catch (IOException e) {
+      collector.addFailure(e.getMessage(), null);
+    }
+    return credentials;
   }
 }

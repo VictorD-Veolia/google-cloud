@@ -18,12 +18,14 @@ package io.cdap.plugin.gcp.bigquery.sink;
 import com.google.auth.Credentials;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryException;
+import com.google.cloud.bigquery.DatasetId;
 import com.google.cloud.bigquery.Field;
 import com.google.cloud.bigquery.FieldList;
 import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.hadoop.io.bigquery.BigQueryConfiguration;
 import com.google.cloud.hadoop.io.bigquery.output.BigQueryTableFieldSchema;
+import com.google.cloud.kms.v1.CryptoKeyName;
 import com.google.common.base.Strings;
 import io.cdap.cdap.api.data.batch.Output;
 import io.cdap.cdap.api.data.batch.OutputFormatProvider;
@@ -37,11 +39,11 @@ import io.cdap.cdap.etl.api.batch.BatchSinkContext;
 import io.cdap.cdap.etl.api.validation.ValidationFailure;
 import io.cdap.plugin.common.LineageRecorder;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryConstants;
+import io.cdap.plugin.gcp.bigquery.util.BigQueryTypeSize;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
+import io.cdap.plugin.gcp.common.CmekUtils;
 import io.cdap.plugin.gcp.common.GCPUtils;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.NullWritable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -86,14 +88,16 @@ public abstract class AbstractBigQuerySink extends BatchSink<StructuredRecord, S
     Credentials credentials = serviceAccount == null ?
       null : GCPUtils.loadServiceAccountCredentials(serviceAccount, config.isServiceAccountFilePath());
     String project = config.getProject();
-    String datasetProjectId = config.getDatasetProject();
-    bigQuery = GCPUtils.getBigQuery(datasetProjectId, credentials);
-    String cmekKey = context.getArguments().get(GCPUtils.CMEK_KEY);
-    baseConfiguration = getBaseConfiguration(cmekKey);
+    bigQuery = GCPUtils.getBigQuery(project, credentials);
+    FailureCollector collector = context.getFailureCollector();
+    CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(config.cmekKey, context.getArguments().asMap(), collector);
+    collector.getOrThrowException();
+    baseConfiguration = getBaseConfiguration(cmekKeyName);
     String bucket = BigQuerySinkUtils.configureBucket(baseConfiguration, config.getBucket(), runUUID.toString());
     if (!context.isPreviewEnabled()) {
-      BigQuerySinkUtils.createResources(bigQuery, GCPUtils.getStorage(project, credentials), config.getDataset(),
-                                        bucket, config.getLocation(), cmekKey);
+      BigQuerySinkUtils.createResources(bigQuery, GCPUtils.getStorage(project, credentials),
+                                        DatasetId.of(config.getDatasetProject(), config.getDataset()),
+                                        bucket, config.getLocation(), cmekKeyName);
     }
 
     prepareRunInternal(context, bigQuery, bucket);
@@ -101,19 +105,15 @@ public abstract class AbstractBigQuerySink extends BatchSink<StructuredRecord, S
 
   @Override
   public void onRunFinish(boolean succeeded, BatchSinkContext context) {
-    Path gcsPath;
+    String gcsPath;
     String bucket = getConfig().getBucket();
     if (bucket == null) {
-      gcsPath = new Path(String.format("gs://%s", runUUID.toString()));
+      gcsPath = String.format("gs://%s", runUUID.toString());
     } else {
-      gcsPath = new Path(String.format(gcsPathFormat, bucket, runUUID.toString()));
+      gcsPath = String.format(gcsPathFormat, bucket, runUUID.toString());
     }
     try {
-      FileSystem fs = gcsPath.getFileSystem(baseConfiguration);
-      if (fs.exists(gcsPath)) {
-        fs.delete(gcsPath, true);
-        LOG.debug("Deleted temporary directory '{}'", gcsPath);
-      }
+      BigQueryUtil.deleteTemporaryDirectory(baseConfiguration, gcsPath);
     } catch (IOException e) {
       LOG.warn("Failed to delete temporary directory '{}': {}", gcsPath, e.getMessage());
     }
@@ -147,8 +147,7 @@ public abstract class AbstractBigQuerySink extends BatchSink<StructuredRecord, S
     // Build GCS storage path for this bucket output.
     String temporaryGcsPath = BigQuerySinkUtils.getTemporaryGcsPath(bucket, runUUID.toString(), tableName);
     BigQuerySinkUtils.configureOutput(configuration,
-                                      getConfig().getDatasetProject(),
-                                      getConfig().getDataset(),
+                                      DatasetId.of(getConfig().getDatasetProject(), getConfig().getDataset()),
                                       tableName,
                                       temporaryGcsPath,
                                       fields);
@@ -206,10 +205,10 @@ public abstract class AbstractBigQuerySink extends BatchSink<StructuredRecord, S
    *
    * @return base configuration
    */
-  private Configuration getBaseConfiguration(@Nullable String cmekKey) throws IOException {
+  private Configuration getBaseConfiguration(@Nullable CryptoKeyName cmekKeyName) throws IOException {
     AbstractBigQuerySinkConfig config = getConfig();
     Configuration baseConfiguration = BigQueryUtil.getBigQueryConfig(config.getServiceAccount(), config.getProject(),
-                                                                     cmekKey, config.getServiceAccountType());
+                                                                     cmekKeyName, config.getServiceAccountType());
     baseConfiguration.setBoolean(BigQueryConstants.CONFIG_ALLOW_SCHEMA_RELAXATION,
                                  config.isAllowSchemaRelaxation());
     baseConfiguration.setStrings(BigQueryConfiguration.OUTPUT_TABLE_WRITE_DISPOSITION_KEY,
@@ -244,7 +243,7 @@ public abstract class AbstractBigQuerySink extends BatchSink<StructuredRecord, S
     for (String field : remainingBQFields) {
       if (bqFields.get(field).getMode() != Field.Mode.NULLABLE) {
         collector.addFailure(String.format("Required Column '%s' is not present in the schema.", field),
-          String.format("Add '%s' to the schema.", field));
+                             String.format("Add '%s' to the schema.", field));
       }
     }
 
@@ -267,6 +266,68 @@ public abstract class AbstractBigQuerySink extends BatchSink<StructuredRecord, S
       }
     }
     collector.getOrThrowException();
+  }
+
+  /**
+   * Check that there are not more than BigQueryTypeSize.Struct.MAX_DEPTH levels in any nested record
+   *
+   * @param schema CDAP schema to check
+   * @param collector Failures will be added to this collector
+   */
+  protected void validateRecordDepth(@Nullable Schema schema, FailureCollector collector) {
+    validateRecordDepth(schema, collector, 0, null);
+  }
+
+  /**
+   * Check that there are not more than BigQueryTypeSize.Struct.MAX_DEPTH levels in any nested record
+   *
+   * @param schema CDAP schema to check
+   * @param collector Failures will be added to this collector
+   * @param depth Current level in hierarchy
+   * @param prefix Used to track hierarchy for error messages
+   */
+  private void validateRecordDepth(@Nullable Schema schema, FailureCollector collector, int depth, String prefix) {
+    // Table is created without schema, so no further validation is required.
+    if (schema == null) {
+      return;
+    }
+    if (prefix == null) {
+      prefix = "";
+    }
+
+    List<Schema.Field> fields = schema.getFields();
+    if (fields == null) {
+      return;
+    }
+
+    for (Schema.Field field: fields) {
+      String fieldName = prefix + field.getName();
+      if (depth == BigQueryTypeSize.Struct.MAX_DEPTH) {
+        collector.addFailure(
+          String.format("Field '%s' exceeds BigQuery maximum allowed depth of %d.",
+                        fieldName, BigQueryTypeSize.Struct.MAX_DEPTH),
+          "Please flatten the schema to contain fewer levels.");
+        continue;
+      }
+
+      Schema fieldSchema = BigQueryUtil.getNonNullableSchema(field.getSchema());
+      switch(fieldSchema.getType()) {
+        case RECORD:
+          validateRecordDepth(fieldSchema, collector, depth + 1, fieldName + ".");
+          break;
+        case ARRAY:
+          if (fieldSchema.getComponentSchema() == null) {
+            break;
+          }
+          Schema componentSchema = BigQueryUtil.getNonNullableSchema(fieldSchema.getComponentSchema());
+          if (componentSchema.getType() == Schema.Type.RECORD) {
+            validateRecordDepth(componentSchema, collector, depth + 1, fieldName + ".");
+          } else {
+            validateRecordDepth(componentSchema, collector, depth, fieldName + ".");
+          }
+          break;
+      }
+    }
   }
 
   /**
@@ -308,7 +369,7 @@ public abstract class AbstractBigQuerySink extends BatchSink<StructuredRecord, S
       for (String nonNullableField : nonNullableFields) {
         collector.addFailure(
           String.format("Required field '%s' does not exist in BigQuery table '%s.%s'.",
-              nonNullableField, getConfig().getDataset(), tableName),
+                        nonNullableField, getConfig().getDataset(), tableName),
           "Change the field to be nullable.")
           .withInputSchemaField(nonNullableField).withOutputSchemaField(nonNullableField);
       }
@@ -376,7 +437,7 @@ public abstract class AbstractBigQuerySink extends BatchSink<StructuredRecord, S
       return Collections.emptyList();
     }
 
-    TableId tableId = TableId.of(getConfig().getProject(), getConfig().getDataset(), tableName);
+    TableId tableId = TableId.of(getConfig().getDatasetProject(), getConfig().getDataset(), tableName);
     try {
       Table table = bigQuery.getTable(tableId);
       // if table is null that mean it does not exist. So there is no need to perform validation

@@ -18,13 +18,20 @@ package io.cdap.plugin.gcp.bigquery.source;
 
 import com.google.auth.Credentials;
 import com.google.cloud.bigquery.BigQuery;
+import com.google.cloud.bigquery.Dataset;
+import com.google.cloud.bigquery.DatasetId;
 import com.google.cloud.bigquery.Field;
 import com.google.cloud.bigquery.FieldList;
 import com.google.cloud.bigquery.StandardTableDefinition;
 import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableDefinition.Type;
 import com.google.cloud.bigquery.TimePartitioning;
+import com.google.cloud.kms.v1.CryptoKeyName;
+import com.google.cloud.storage.Storage;
+import com.google.common.base.Strings;
 import io.cdap.cdap.api.annotation.Description;
+import io.cdap.cdap.api.annotation.Metadata;
+import io.cdap.cdap.api.annotation.MetadataProperty;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.annotation.Plugin;
 import io.cdap.cdap.api.data.batch.Input;
@@ -38,10 +45,13 @@ import io.cdap.cdap.etl.api.StageConfigurer;
 import io.cdap.cdap.etl.api.batch.BatchRuntimeContext;
 import io.cdap.cdap.etl.api.batch.BatchSource;
 import io.cdap.cdap.etl.api.batch.BatchSourceContext;
+import io.cdap.cdap.etl.api.connector.Connector;
 import io.cdap.cdap.etl.api.validation.ValidationFailure;
 import io.cdap.plugin.common.LineageRecorder;
+import io.cdap.plugin.gcp.bigquery.connector.BigQueryConnector;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryConstants;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
+import io.cdap.plugin.gcp.common.CmekUtils;
 import io.cdap.plugin.gcp.common.GCPUtils;
 import org.apache.avro.generic.GenericData;
 import org.apache.hadoop.conf.Configuration;
@@ -58,11 +68,12 @@ import javax.annotation.Nullable;
 /**
  * Class description here.
  */
-@Plugin(type = "batchsource")
+@Plugin(type = BatchSource.PLUGIN_TYPE)
 @Name(BigQuerySource.NAME)
 @Description("This source reads the entire contents of a BigQuery table. "
   + "BigQuery is Google's serverless, highly scalable, enterprise data warehouse."
   + "Data is first written to a temporary location on Google Cloud Storage, then read into the pipeline from there.")
+@Metadata(properties = {@MetadataProperty(key = Connector.PLUGIN_TYPE, value = BigQueryConnector.NAME)})
 public final class BigQuerySource extends BatchSource<LongWritable, GenericData.Record, StructuredRecord> {
   private static final Logger LOG = LoggerFactory.getLogger(BigQuerySource.class);
   public static final String NAME = "BigQueryTable";
@@ -104,7 +115,7 @@ public final class BigQuerySource extends BatchSource<LongWritable, GenericData.
   @Override
   public void prepareRun(BatchSourceContext context) throws Exception {
     FailureCollector collector = context.getFailureCollector();
-    config.validate(collector);
+    config.validate(collector, context.getArguments().asMap());
 
     if (getBQSchema(collector).getFields().isEmpty()) {
       collector.addFailure(String.format("BigQuery table %s.%s does not have a schema.",
@@ -117,25 +128,28 @@ public final class BigQuerySource extends BatchSource<LongWritable, GenericData.
 
     // Create BigQuery client
     String serviceAccount = config.getServiceAccount();
-    Credentials credentials = BigQuerySourceUtils.getCredentials(config);
-    BigQuery bigQuery = GCPUtils.getBigQuery(config.getDatasetProject(), credentials);
+    Credentials credentials = BigQuerySourceUtils.getCredentials(config.getConnection());
+    BigQuery bigQuery = GCPUtils.getBigQuery(config.getProject(), credentials);
+    Dataset dataset = bigQuery.getDataset(DatasetId.of(config.getDatasetProject(), config.getDataset()));
+    Storage storage = GCPUtils.getStorage(config.getProject(), credentials);
 
     // Get Configuration for this run
     bucketPath = UUID.randomUUID().toString();
-    String cmekKey = context.getArguments().get(GCPUtils.CMEK_KEY);
-    configuration = BigQueryUtil.getBigQueryConfig(serviceAccount, config.getProject(), cmekKey,
+    CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(config.cmekKey, context.getArguments().asMap(), collector);
+    collector.getOrThrowException();
+    configuration = BigQueryUtil.getBigQueryConfig(serviceAccount, config.getProject(), cmekKeyName,
                                                    config.getServiceAccountType());
 
     // Configure GCS Bucket to use
     String bucket = BigQuerySourceUtils.getOrCreateBucket(configuration,
-                                                          config,
-                                                          bigQuery,
-                                                          credentials,
+                                                          storage,
+                                                          config.getBucket(),
+                                                          dataset,
                                                           bucketPath,
-                                                          cmekKey);
+                                                          cmekKeyName);
 
     // Configure Service account credentials
-    BigQuerySourceUtils.configureServiceAccount(configuration, config);
+    BigQuerySourceUtils.configureServiceAccount(configuration, config.getConnection());
 
     // Configure BQ Source
     configureBigQuerySource();
@@ -143,8 +157,7 @@ public final class BigQuerySource extends BatchSource<LongWritable, GenericData.
     // Configure BigQuery input format.
     String temporaryGcsPath = BigQuerySourceUtils.getTemporaryGcsPath(bucket, bucketPath, bucketPath);
     BigQuerySourceUtils.configureBigQueryInput(configuration,
-                                               config.getDatasetProject(),
-                                               config.getDataset(),
+                                               DatasetId.of(config.getDatasetProject(), config.getDataset()),
                                                config.getTable(),
                                                temporaryGcsPath);
 
@@ -178,7 +191,7 @@ public final class BigQuerySource extends BatchSource<LongWritable, GenericData.
 
   @Override
   public void onRunFinish(boolean succeeded, BatchSourceContext context) {
-    BigQuerySourceUtils.deleteGcsTemporaryDirectory(configuration, config, bucketPath);
+    BigQuerySourceUtils.deleteGcsTemporaryDirectory(configuration, config.getBucket(), bucketPath);
     BigQuerySourceUtils.deleteBigQueryTemporaryTable(configuration, config);
   }
 

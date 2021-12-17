@@ -6,7 +6,6 @@ import com.google.api.services.bigquery.model.JobConfigurationQuery;
 import com.google.api.services.bigquery.model.JobReference;
 import com.google.api.services.bigquery.model.Table;
 import com.google.api.services.bigquery.model.TableReference;
-import com.google.cloud.bigquery.JobId;
 import com.google.cloud.bigquery.LegacySQLTypeName;
 import com.google.cloud.bigquery.StandardTableDefinition;
 import com.google.cloud.bigquery.TableDefinition.Type;
@@ -19,9 +18,9 @@ import com.google.cloud.hadoop.io.bigquery.BigQueryHelper;
 import com.google.cloud.hadoop.io.bigquery.BigQueryUtils;
 import com.google.cloud.hadoop.io.bigquery.ExportFileFormat;
 import com.google.cloud.hadoop.util.ConfigurationUtil;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
-import com.sun.istack.Nullable;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryConstants;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
 import org.apache.avro.generic.GenericData;
@@ -39,8 +38,8 @@ import java.security.GeneralSecurityException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
 
 /**
  * BigQuery input format, splits query from the configuration into list of queries
@@ -84,7 +83,8 @@ public class PartitionedBigQueryInputFormat extends AbstractBigQueryInputFormat<
     }
     Map<String, String> mandatoryConfig = ConfigurationUtil.getMandatoryConfig(
       configuration, BigQueryConfiguration.MANDATORY_CONFIG_PROPERTIES_INPUT);
-    String inputProjectId = mandatoryConfig.get(BigQueryConfiguration.INPUT_PROJECT_ID_KEY);
+    String projectId = mandatoryConfig.get(BigQueryConfiguration.PROJECT_ID_KEY);
+    String datasetProjectId = mandatoryConfig.get(BigQueryConfiguration.INPUT_PROJECT_ID_KEY);
     String datasetId = mandatoryConfig.get(BigQueryConfiguration.INPUT_DATASET_ID_KEY);
     String tableName = mandatoryConfig.get(BigQueryConfiguration.INPUT_TABLE_ID_KEY);
     String serviceAccount = configuration.get(BigQueryConstants.CONFIG_SERVICE_ACCOUNT, null);
@@ -95,26 +95,26 @@ public class PartitionedBigQueryInputFormat extends AbstractBigQueryInputFormat<
     String partitionToDate = configuration.get(BigQueryConstants.CONFIG_PARTITION_TO_DATE, null);
     String filter = configuration.get(BigQueryConstants.CONFIG_FILTER, null);
 
-    com.google.cloud.bigquery.Table bigQueryTable =
-      BigQueryUtil.getBigQueryTable(inputProjectId, datasetId, tableName, serviceAccount, isServiceAccountFilePath);
+    com.google.cloud.bigquery.Table bigQueryTable = BigQueryUtil.getBigQueryTable(
+      datasetProjectId, datasetId, tableName, serviceAccount, isServiceAccountFilePath);
     Type type = Objects.requireNonNull(bigQueryTable).getDefinition().getType();
 
     String query;
     if (type == Type.VIEW || type == Type.MATERIALIZED_VIEW) {
-      query = generateQueryForMaterializingView(datasetId, tableName, filter);
+      query = generateQueryForMaterializingView(datasetProjectId, datasetId, tableName, filter);
     } else {
-      query = generateQuery(partitionFromDate, partitionToDate, filter, inputProjectId, datasetId, tableName,
-                            serviceAccount, isServiceAccountFilePath);
+      query = generateQuery(partitionFromDate, partitionToDate, filter, projectId, datasetProjectId, datasetId,
+                            tableName, serviceAccount, isServiceAccountFilePath);
     }
 
     if (query != null) {
-      TableReference sourceTable = new TableReference().setDatasetId(datasetId).setProjectId(inputProjectId)
+      TableReference sourceTable = new TableReference().setDatasetId(datasetId).setProjectId(datasetProjectId)
         .setTableId(tableName);
       String location = bigQueryHelper.getTable(sourceTable).getLocation();
       String temporaryTableName = configuration.get(BigQueryConstants.CONFIG_TEMPORARY_TABLE_NAME);
-      TableReference exportTableReference = createExportTableReference(type, inputProjectId, datasetId,
+      TableReference exportTableReference = createExportTableReference(type, datasetProjectId, datasetId,
                                                                        temporaryTableName, configuration);
-      runQuery(configuration, bigQueryHelper, inputProjectId, exportTableReference, query, location);
+      runQuery(configuration, bigQueryHelper, projectId, exportTableReference, query, location);
       if (type == Type.VIEW || type == Type.MATERIALIZED_VIEW) {
         configuration.set(BigQueryConfiguration.INPUT_PROJECT_ID_KEY,
                           configuration.get(BigQueryConstants.CONFIG_VIEW_MATERIALIZATION_PROJECT));
@@ -125,14 +125,15 @@ public class PartitionedBigQueryInputFormat extends AbstractBigQueryInputFormat<
     }
   }
 
-  private String generateQuery(String partitionFromDate, String partitionToDate, String filter,
-                               String project, String dataset, String table, @Nullable String serviceAccount,
-                               @Nullable Boolean isServiceAccountFilePath) {
+  @VisibleForTesting
+  String generateQuery(String partitionFromDate, String partitionToDate, String filter, String project,
+                       String datasetProject, String dataset, String table, @Nullable String serviceAccount,
+                       @Nullable Boolean isServiceAccountFilePath) {
     if (partitionFromDate == null && partitionToDate == null && filter == null) {
       return null;
     }
-    String queryTemplate = "select * from %s where %s";
-    com.google.cloud.bigquery.Table sourceTable = BigQueryUtil.getBigQueryTable(project, dataset, table,
+    String queryTemplate = "select * from `%s` where %s";
+    com.google.cloud.bigquery.Table sourceTable = BigQueryUtil.getBigQueryTable(datasetProject, dataset, table,
                                                                                 serviceAccount,
                                                                                 isServiceAccountFilePath);
     StandardTableDefinition tableDefinition = Objects.requireNonNull(sourceTable).getDefinition();
@@ -156,19 +157,20 @@ public class PartitionedBigQueryInputFormat extends AbstractBigQueryInputFormat<
       }
     }
 
-    String tableName = dataset + "." + table;
+    String tableName = datasetProject + "." + dataset + "." + table;
     return String.format(queryTemplate, tableName, condition.toString());
   }
 
-  private String generateQueryForMaterializingView(String dataset, String table, String filter) {
-    String queryTemplate = "select * from %s %s";
+  @VisibleForTesting
+  String generateQueryForMaterializingView(String datasetProject, String dataset, String table, String filter) {
+    String queryTemplate = "select * from `%s`%s";
     StringBuilder condition = new StringBuilder();
 
     if (!Strings.isNullOrEmpty(filter)) {
       condition.append(String.format(" where %s", filter));
     }
 
-    String tableName = dataset + "." + table;
+    String tableName = datasetProject + "." + dataset + "." + table;
     return String.format(queryTemplate, tableName, condition.toString());
   }
 
@@ -176,7 +178,7 @@ public class PartitionedBigQueryInputFormat extends AbstractBigQueryInputFormat<
    * Create {@link TableReference} to export Table or View
    *
    * @param type           BigQuery table type
-   * @param inputProjectId project id of source table
+   * @param datasetProjectId project id of source table
    * @param datasetId      dataset id of source table
    * @param tableId        The ID of the table
    * @param configuration  Configuration that contains View Materialization ProjectId and View
@@ -184,7 +186,7 @@ public class PartitionedBigQueryInputFormat extends AbstractBigQueryInputFormat<
    * @return {@link TableReference}
    */
   private TableReference createExportTableReference(
-    Type type, String inputProjectId,
+    Type type, String datasetProjectId,
     String datasetId,
     String tableId,
     Configuration configuration) {
@@ -195,7 +197,7 @@ public class PartitionedBigQueryInputFormat extends AbstractBigQueryInputFormat<
       tableReference.setProjectId(configuration.get(BigQueryConstants.CONFIG_VIEW_MATERIALIZATION_PROJECT));
       tableReference.setDatasetId(configuration.get(BigQueryConstants.CONFIG_VIEW_MATERIALIZATION_DATASET));
     } else {
-      tableReference.setProjectId(inputProjectId);
+      tableReference.setProjectId(datasetProjectId);
       tableReference.setDatasetId(datasetId);
     }
 

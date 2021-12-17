@@ -21,6 +21,7 @@ import com.google.cloud.bigquery.RangePartitioning;
 import com.google.cloud.bigquery.StandardTableDefinition;
 import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TimePartitioning;
+import com.google.cloud.kms.v1.CryptoKeyName;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSet;
@@ -31,12 +32,15 @@ import io.cdap.cdap.api.data.schema.Schema;
 import io.cdap.cdap.api.data.schema.Schema.LogicalType;
 import io.cdap.cdap.api.data.schema.Schema.Type;
 import io.cdap.cdap.etl.api.FailureCollector;
+import io.cdap.plugin.gcp.bigquery.connector.BigQueryConnectorConfig;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
+import io.cdap.plugin.gcp.common.CmekUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -164,7 +168,7 @@ public final class BigQuerySinkConfig extends AbstractBigQuerySinkConfig {
   @Macro
   @Nullable
   @Description("Partition filter that can be used for partition elimination during Update or Upsert operations." +
-          "This value is ignored if operation is not UPDATE or UPSERT.")
+    "This value is ignored if operation is not UPDATE or UPSERT.")
   protected String partitionFilter;
 
   @VisibleForTesting
@@ -182,6 +186,20 @@ public final class BigQuerySinkConfig extends AbstractBigQuerySinkConfig {
     this.rangeEnd = rangeEnd;
     this.rangeInterval = rangeInterval;
     this.gcsChunkSize = gcsChunkSize;
+  }
+
+  private BigQuerySinkConfig(@Nullable String referenceName, @Nullable String project,
+                            @Nullable String serviceAccountType, @Nullable String serviceFilePath,
+                            @Nullable String serviceAccountJson, @Nullable String dataset, @Nullable String table,
+                            @Nullable String location, @Nullable String cmekKey, @Nullable String bucket) {
+    this.referenceName = referenceName;
+    this.connection = new BigQueryConnectorConfig(project, project, serviceAccountType,
+                                                  serviceFilePath, serviceAccountJson);
+    this.dataset = dataset;
+    this.table = table;
+    this.location = location;
+    this.cmekKey = cmekKey;
+    this.bucket = bucket;
   }
 
   public String getTable() {
@@ -274,8 +292,8 @@ public final class BigQuerySinkConfig extends AbstractBigQuerySinkConfig {
   }
 
   @Override
-  public void validate(FailureCollector collector) {
-    super.validate(collector);
+  public void validate(FailureCollector collector, Map<String, String> arguments) {
+    super.validate(collector, arguments);
 
     if (!containsMacro(NAME_TABLE)) {
       BigQueryUtil.validateTable(table, NAME_TABLE, collector);
@@ -297,8 +315,9 @@ public final class BigQuerySinkConfig extends AbstractBigQuerySinkConfig {
    * @param outputSchema output schema to BigQuery sink
    * @param collector failure collector
    */
-  public void validate(@Nullable Schema inputSchema, @Nullable Schema outputSchema, FailureCollector collector) {
-    validate(collector);
+  public void validate(@Nullable Schema inputSchema, @Nullable Schema outputSchema, FailureCollector collector,
+                       Map<String, String> arguments) {
+    validate(collector, arguments);
     if (!containsMacro(NAME_SCHEMA)) {
       Schema schema = outputSchema == null ? inputSchema : outputSchema;
       validatePartitionProperties(schema, collector);
@@ -644,16 +663,108 @@ public final class BigQuerySinkConfig extends AbstractBigQuerySinkConfig {
     return false;
   }
 
+  @Override
+  void validateCmekKey(FailureCollector failureCollector, Map<String, String> arguments) {
+    CryptoKeyName cmekKeyName = CmekUtils.getCmekKey(cmekKey, arguments, failureCollector);
+    //these fields are needed to check if bucket exists or not and for location validation
+    if (containsMacro(NAME_LOCATION) || containsMacro(NAME_TABLE) || Strings.isNullOrEmpty(table)) {
+      return;
+    }
+    validateCmekKeyLocation(cmekKeyName, getTable(), location, failureCollector);
+  }
+
   /**
    * Returns true if bigquery table can be connected to or schema is not a macro.
    */
   boolean shouldConnect() {
     return !containsMacro(BigQuerySinkConfig.NAME_DATASET) &&
-      !containsMacro(BigQuerySinkConfig.NAME_TABLE) &&
-      !containsMacro(NAME_SERVICE_ACCOUNT_TYPE) &&
-      !(containsMacro(NAME_SERVICE_ACCOUNT_FILE_PATH) || containsMacro(NAME_SERVICE_ACCOUNT_JSON)) &&
-      !containsMacro(BigQuerySinkConfig.NAME_PROJECT) &&
-      !containsMacro(BigQuerySinkConfig.DATASET_PROJECT_ID) &&
+      !containsMacro(BigQuerySinkConfig.NAME_TABLE) && connection != null && connection.canConnect() &&
       !containsMacro(BigQuerySinkConfig.NAME_SCHEMA);
+  }
+
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  /**
+   * BigQuery Sink configuration builder.
+   */
+  public static class Builder {
+    private String referenceName;
+    private String serviceAccountType;
+    private String serviceFilePath;
+    private String serviceAccountJson;
+    private String project;
+    private String dataset;
+    private String table;
+    private String cmekKey;
+    private String location;
+    private String bucket;
+
+    public BigQuerySinkConfig.Builder setReferenceName(@Nullable String referenceName) {
+      this.referenceName = referenceName;
+      return this;
+    }
+
+    public BigQuerySinkConfig.Builder setProject(@Nullable String project) {
+      this.project = project;
+      return this;
+    }
+
+    public BigQuerySinkConfig.Builder setServiceAccountType(@Nullable String serviceAccountType) {
+      this.serviceAccountType = serviceAccountType;
+      return this;
+    }
+
+    public BigQuerySinkConfig.Builder setServiceFilePath(@Nullable String serviceFilePath) {
+      this.serviceFilePath = serviceFilePath;
+      return this;
+    }
+
+    public BigQuerySinkConfig.Builder setServiceAccountJson(@Nullable String serviceAccountJson) {
+      this.serviceAccountJson = serviceAccountJson;
+      return this;
+    }
+
+    public BigQuerySinkConfig.Builder setDataset(@Nullable String dataset) {
+      this.dataset = dataset;
+      return this;
+    }
+
+    public BigQuerySinkConfig.Builder setTable(@Nullable String table) {
+      this.table = table;
+      return this;
+    }
+
+    public BigQuerySinkConfig.Builder setCmekKey(@Nullable String cmekKey) {
+      this.cmekKey = cmekKey;
+      return this;
+    }
+
+    public BigQuerySinkConfig.Builder setLocation(@Nullable String location) {
+      this.location = location;
+      return this;
+    }
+
+    public BigQuerySinkConfig.Builder setBucket(@Nullable String bucket) {
+      this.bucket = bucket;
+      return this;
+    }
+
+    public BigQuerySinkConfig build() {
+      return new BigQuerySinkConfig(
+        referenceName,
+        project,
+        serviceAccountType,
+        serviceFilePath,
+        serviceAccountJson,
+        dataset,
+        table,
+        location,
+        cmekKey,
+        bucket
+      );
+    }
+
   }
 }

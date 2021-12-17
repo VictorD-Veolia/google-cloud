@@ -19,18 +19,22 @@ package io.cdap.plugin.gcp.bigquery.sink;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryException;
 import com.google.cloud.bigquery.Dataset;
+import com.google.cloud.bigquery.DatasetId;
 import com.google.cloud.bigquery.DatasetInfo;
+import com.google.cloud.bigquery.EncryptionConfiguration;
 import com.google.cloud.bigquery.Field;
 import com.google.cloud.bigquery.LegacySQLTypeName;
 import com.google.cloud.hadoop.io.bigquery.BigQueryFileFormat;
 import com.google.cloud.hadoop.io.bigquery.output.BigQueryOutputConfiguration;
 import com.google.cloud.hadoop.io.bigquery.output.BigQueryTableFieldSchema;
 import com.google.cloud.hadoop.io.bigquery.output.BigQueryTableSchema;
+import com.google.cloud.kms.v1.CryptoKeyName;
 import com.google.cloud.storage.Bucket;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageException;
 import io.cdap.cdap.api.data.schema.Schema;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryConstants;
+import io.cdap.plugin.gcp.bigquery.util.BigQueryTypeSize.Numeric;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
 import io.cdap.plugin.gcp.common.GCPUtils;
 import org.apache.hadoop.conf.Configuration;
@@ -55,6 +59,7 @@ public final class BigQuerySinkUtils {
   public static final String GS_PATH_FORMAT = "gs://%s/%s";
   private static final String TEMPORARY_BUCKET_FORMAT = GS_PATH_FORMAT + "/input/%s-%s";
   private static final String DATETIME = "DATETIME";
+  private static final String RECORD = "RECORD";
 
   /**
    * Creates the given dataset and bucket if they do not already exist. If the dataset already exists but the
@@ -64,53 +69,60 @@ public final class BigQuerySinkUtils {
    *
    * @param bigQuery the bigquery client for the project
    * @param storage the storage client for the project
-   * @param datasetName the name of the dataset
+   * @param datasetId the Id of the dataset
    * @param bucketName the name of the bucket
    * @param location the location of the resources, this is only applied if both the bucket and dataset do not exist
-   * @param cmekKey the name of the cmek key
+   * @param cmekKeyName the name of the cmek key
    * @throws IOException if there was an error creating or fetching any GCP resource
    */
   public static void createResources(BigQuery bigQuery, Storage storage,
-                                     String datasetName, String bucketName, @Nullable String location,
-                                     @Nullable String cmekKey) throws IOException {
-    Dataset dataset = bigQuery.getDataset(datasetName);
+                                     DatasetId datasetId, String bucketName, @Nullable String location,
+                                     @Nullable CryptoKeyName cmekKeyName) throws IOException {
+    Dataset dataset = bigQuery.getDataset(datasetId);
     Bucket bucket = storage.get(bucketName);
 
     if (dataset == null && bucket == null) {
-      createBucket(storage, bucketName, location, cmekKey,
+      createBucket(storage, bucketName, location, cmekKeyName,
                    () -> String.format("Unable to create Cloud Storage bucket '%s'", bucketName));
-      createDataset(bigQuery, datasetName, location,
-                    () -> String.format("Unable to create BigQuery dataset '%s'", datasetName));
+      createDataset(bigQuery, datasetId, location, cmekKeyName,
+                    () -> String.format("Unable to create BigQuery dataset '%s.%s'", datasetId.getProject(),
+                                        datasetId.getDataset()));
     } else if (bucket == null) {
       createBucket(
-        storage, bucketName, dataset.getLocation(), cmekKey,
+        storage, bucketName, dataset.getLocation(), cmekKeyName,
         () -> String.format(
           "Unable to create Cloud Storage bucket '%s' in the same location ('%s') as BigQuery dataset '%s'. "
             + "Please use a bucket that is in the same location as the dataset.",
-          bucketName, dataset.getLocation(), datasetName));
+          bucketName, dataset.getLocation(), datasetId.getProject() + "." + datasetId.getDataset()));
     } else if (dataset == null) {
       createDataset(
-        bigQuery, datasetName, bucket.getLocation(),
+        bigQuery, datasetId, bucket.getLocation(), cmekKeyName,
         () -> String.format(
           "Unable to create BigQuery dataset '%s' in the same location ('%s') as Cloud Storage bucket '%s'. "
             + "Please use a bucket that is in a supported location.",
-          datasetName, bucket.getLocation(), bucketName));
+          datasetId, bucket.getLocation(), bucketName));
     }
   }
 
   /**
    * Creates a Dataset in the specified location using the supplied BigQuery client.
    * @param bigQuery the bigQuery client.
-   * @param dataset the name of the dataset to create.
+   * @param dataset the Id of the dataset to create.
    * @param location Location for this dataset.
+   * @param cmekKeyName CMEK key to use for this dataset.
    * @param errorMessage Supplier for the error message to output if the dataset could not be created.
    * @throws IOException if the dataset could not be created.
    */
-  private static void createDataset(BigQuery bigQuery, String dataset, @Nullable String location,
-                                    Supplier<String> errorMessage) throws IOException {
+  public static void createDataset(BigQuery bigQuery, DatasetId dataset, @Nullable String location,
+                                   @Nullable CryptoKeyName cmekKeyName,
+                                   Supplier<String> errorMessage) throws IOException {
     DatasetInfo.Builder builder = DatasetInfo.newBuilder(dataset);
     if (location != null) {
       builder.setLocation(location);
+    }
+    if (cmekKeyName != null) {
+      builder.setDefaultEncryptionConfiguration(
+        EncryptionConfiguration.newBuilder().setKmsKeyName(cmekKeyName.toString()).build());
     }
     try {
       bigQuery.create(builder.build());
@@ -129,14 +141,15 @@ public final class BigQuerySinkUtils {
    * @param storage GCS Client.
    * @param bucket Bucket Name.
    * @param location Location for this bucket.
-   * @param cmekKey CMEK key to use for this bucket.
+   * @param cmekKeyName CMEK key to use for this bucket.
    * @param errorMessage Supplier for the error message to output if the bucket could not be created.
    * @throws IOException if the bucket could not be created.
    */
   private static void createBucket(Storage storage, String bucket, @Nullable String location,
-                                   @Nullable String cmekKey, Supplier<String> errorMessage) throws IOException {
+                                   @Nullable CryptoKeyName cmekKeyName,
+                                   Supplier<String> errorMessage) throws IOException {
     try {
-      GCPUtils.createBucket(storage, bucket, location, cmekKey);
+      GCPUtils.createBucket(storage, bucket, location, cmekKeyName);
     } catch (StorageException e) {
       if (e.getCode() != 409) {
         // A conflict means the bucket already exists
@@ -154,8 +167,26 @@ public final class BigQuerySinkUtils {
    * @return bucket name
    */
   public static String configureBucket(Configuration baseConfiguration, @Nullable String bucket, String runId) {
+    boolean deleteBucket = false;
+    // If the bucket is null, assign the run ID as the bucket name and mark the bucket for deletion.
     if (bucket == null) {
       bucket = runId;
+      deleteBucket = true;
+    }
+    return configureBucket(baseConfiguration, bucket, runId, deleteBucket);
+  }
+
+  /**
+   * Updates {@link Configuration} with bucket details.
+   * Uses provided bucket, otherwise uses provided runId as a bucket name.
+   *
+   * @return bucket name
+   */
+  public static String configureBucket(Configuration baseConfiguration,
+                                       String bucket,
+                                       String runId,
+                                       boolean deleteBucket) {
+    if (deleteBucket) {
       // By default, this option is false, meaning the job can not delete the bucket.
       // So enable it only when bucket name is not provided.
       baseConfiguration.setBoolean("fs.gs.bucket.delete.enable", true);
@@ -170,16 +201,14 @@ public final class BigQuerySinkUtils {
    * Configures output for Sink
    *
    * @param configuration Hadoop configuration instance
-   * @param projectName name of the project to use
-   * @param datasetName name of the dataset to use
+   * @param datasetId id of the dataset to use
    * @param tableName name of the table to use
    * @param gcsPath GCS path to use for output
    * @param fields list of BigQuery table fields
    * @throws IOException if the output cannot be configured
    */
   public static void configureOutput(Configuration configuration,
-                                     String projectName,
-                                     String datasetName,
+                                     DatasetId datasetId,
                                      String tableName,
                                      String gcsPath,
                                      List<BigQueryTableFieldSchema> fields) throws IOException {
@@ -193,7 +222,7 @@ public final class BigQuerySinkUtils {
     BigQueryFileFormat fileFormat = getFileFormat(fields);
     BigQueryOutputConfiguration.configure(
       configuration,
-      String.format("%s:%s.%s", projectName, datasetName, tableName),
+      String.format("%s:%s.%s", datasetId.getProject(), datasetId.getDataset(), tableName),
       outputTableSchema,
       gcsPath,
       fileFormat,
@@ -204,22 +233,19 @@ public final class BigQuerySinkUtils {
    * Configures output for MultiSink
    *
    * @param configuration Hadoop configuration instance
-   * @param projectName name of the project to use
-   * @param datasetName name of the dataset to use
+   * @param datasetId name of the dataset to use
    * @param tableName name of the table to use
    * @param gcsPath GCS path to use for output
    * @param fields list of BigQuery table fields
    * @throws IOException if the output cannot be configured
    */
   public static void configureMultiSinkOutput(Configuration configuration,
-                                              String projectName,
-                                              String datasetName,
+                                              DatasetId datasetId,
                                               String tableName,
                                               String gcsPath,
                                               List<BigQueryTableFieldSchema> fields) throws IOException {
     configureOutput(configuration,
-                    projectName,
-                    datasetName,
+                    datasetId,
                     tableName,
                     gcsPath,
                     fields);
@@ -247,16 +273,20 @@ public final class BigQuerySinkUtils {
     fieldSchema.setType(type.name());
     if (type == LegacySQLTypeName.RECORD) {
       List<Schema.Field> schemaFields;
-      if (Schema.Type.ARRAY == field.getSchema().getType()) {
-        schemaFields = Objects.requireNonNull(field.getSchema().getComponentSchema()).getFields();
+      Schema fieldCdapSchema = BigQueryUtil.getNonNullableSchema(field.getSchema());
+
+      // If its an Array of records we need to get the component schema of the array
+      // which will be the Record. Which can itself be nullable, and then get the fields
+      // of that record.
+      if (Schema.Type.ARRAY == fieldCdapSchema.getType()) {
+        schemaFields = Objects.requireNonNull(
+            BigQueryUtil.getNonNullableSchema(fieldCdapSchema.getComponentSchema()).getFields());
       } else {
-        schemaFields = field.getSchema().isNullable()
-          ? field.getSchema().getNonNullable().getFields()
-          : field.getSchema().getFields();
+        schemaFields = fieldCdapSchema.getFields();
       }
       fieldSchema.setFields(Objects.requireNonNull(schemaFields).stream()
-                              .map(BigQuerySinkUtils::generateTableFieldSchema)
-                              .collect(Collectors.toList()));
+          .map(BigQuerySinkUtils::generateTableFieldSchema)
+          .collect(Collectors.toList()));
 
     }
     return fieldSchema;
@@ -273,6 +303,10 @@ public final class BigQuerySinkUtils {
     return Field.Mode.REQUIRED;
   }
 
+  /**
+   * This function returns the LegacySQLTypeName that maps to the given CDAP Schema.
+   * If the CDAP Schema is an Array it will return the LegacySQLTypename of the components.
+   */
   private static LegacySQLTypeName getTableDataType(Schema schema) {
     schema = BigQueryUtil.getNonNullableSchema(schema);
     Schema.LogicalType logicalType = schema.getLogicalType();
@@ -288,7 +322,13 @@ public final class BigQuerySinkUtils {
         case TIMESTAMP_MICROS:
           return LegacySQLTypeName.TIMESTAMP;
         case DECIMAL:
-          return LegacySQLTypeName.NUMERIC;
+          // Following the restrictions given by:
+          // https://cloud.google.com/bigquery/docs/reference/standard-sql/data-types#numeric_types
+          if ((schema.getScale() <= Numeric.SCALE) && (schema.getPrecision() <= Numeric.PRECISION) &&
+            ((schema.getPrecision() - schema.getScale()) <= (Numeric.PRECISION - Numeric.SCALE))) {
+            return LegacySQLTypeName.NUMERIC;
+          }
+          return LegacySQLTypeName.BIGNUMERIC;
         case DATETIME:
           return LegacySQLTypeName.DATETIME;
         default:
@@ -323,6 +363,12 @@ public final class BigQuerySinkUtils {
     for (BigQueryTableFieldSchema field : fields) {
       if (DATETIME.equals(field.getType())) {
         return BigQueryFileFormat.NEWLINE_DELIMITED_JSON;
+      }
+      // If the field is a record we have to check its subfields.
+      if (RECORD.equals(field.getType())) {
+        if (getFileFormat(field.getFields()) == BigQueryFileFormat.NEWLINE_DELIMITED_JSON) {
+          return BigQueryFileFormat.NEWLINE_DELIMITED_JSON;
+        }
       }
     }
     return BigQueryFileFormat.AVRO;

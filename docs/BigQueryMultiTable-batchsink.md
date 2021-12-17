@@ -22,23 +22,29 @@ Properties
 ----------
 **Reference Name:** Name used to uniquely identify this sink for lineage, annotating metadata, etc.
 
+**Use Connection** Whether to use a connection. If a connection is used, you do not need to provide the credentials.
+
+**Connection** Name of the connection to use. Project and service account information will be provided by the connection.
+You also can use the macro function ${conn(connection-name)}.
+
 **Project ID:** Google Cloud Project ID, which uniquely identifies a project.
 It can be found on the Dashboard in the Google Cloud Platform Console. This is the project
-that the BigQuery job will run in. If a temporary bucket needs to be created, the service account
-must have permission in this project to create buckets.
+that the BigQuery job will run in. `BigQuery Job User` role on this project must be granted to the specified service
+account to run the job. If a temporary bucket needs to be created, the bucket will also be created in this project and
+'GCE Storage Bucket Admin' role on this project must be granted to the specified service account to create buckets.
 
-**Dataset Project**: Project the dataset belongs to. This is only required if the dataset is not
+**Dataset Project ID**: Project the dataset belongs to. This is only required if the dataset is not
 in the same project that the BigQuery job will run in. If no value is given, it will default to the 
-configured Project ID.
+configured Project ID. `BigQuery Data Editor` role on this project must be granted to the specified service account to
+write BigQuery data to this project.
 
 **Dataset:** Dataset the tables belongs to. A dataset is contained within a specific project.
 Datasets are top-level containers that are used to organize and control access to tables and views.
 If dataset does not exist, it will be created.
 
 **Temporary Bucket Name:** Google Cloud Storage bucket to store temporary data in.
-It will be automatically created if it does not exist, but will not be automatically deleted.
-Temporary data will be deleted after it is loaded into BigQuery. If it is not provided, a unique
-bucket will be created and then deleted after the run finishes.
+It will be automatically created if it does not exist. Temporary data will be deleted after it is loaded into BigQuery.
+If the bucket was created automatically, it will be deleted after the run finishes.
 
 **GCS Upload Request Chunk Size**: GCS upload request chunk size in bytes. Default value is 8388608 bytes.
 
@@ -48,7 +54,11 @@ Should only be used with the Insert operation.
 **Location:** The location where the big query datasets will get created. This value is ignored
 if the dataset or temporary bucket already exist.
 
-**Split Field:** The name of the field that will be used to determine which table to write to.
+**Encryption Key Name**: Used to encrypt data written to any bucket, dataset, or table created by the plugin.
+If the bucket, dataset, or table already exists, this is ignored.
+
+**Split Field:** The name of the field that will be used to determine which table to write to. If unspecified, it
+defaults to `tablename`. This field is used when Allow Flexible Schemas in Output configuration is enabled.
 
 **Update Table Schema**: Whether the BigQuery table schema should be modified 
 when it does not match the schema expected by the pipeline. 
@@ -67,8 +77,9 @@ In this case, those fields in the BigQuery schema will be modified to become nul
                          
 Incompatible schema changes will result in pipeline failure.
 
-**Allow flexible schemas in Output**: When enabled, this sink will write out records with arbitrary schemas. 
+**Allow Flexible Schemas in Output**: When enabled, this sink will write out records with arbitrary schemas.
 Records may not have a well defined schema depending on the source.
+When disabled, table schemas must be passed in pipeline arguments.
 
 **Service Account**  - service account key used for authorization
 
@@ -98,3 +109,113 @@ Suppose the input records are:
 
 The plugin will expect two pipeline arguments to tell it to write the first two records to an `accounts` table
 and others records to an `activity` table.
+
+Trouble Shooting
+----------------
+
+**missing permission to create a temporary bucket**
+If your pipeline failed with the following error in the log:
+```
+com.google.api.client.googleapis.json.GoogleJsonResponseException: 403 Forbidden
+POST https://storage.googleapis.com/storage/v1/b?project=projectId&projection=full
+{
+"code" : 403,
+"errors" : [ {
+"domain" : "global",
+"message" : "xxxxxxxxxxxx-compute@developer.gserviceaccount.com does not have storage.buckets.create access to the Google Cloud project.",
+"reason" : "forbidden"
+} ],
+"message" : "xxxxxxxxxxxx-compute@developer.gserviceaccount.com does not have storage.buckets.create access to the Google Cloud project."
+}
+```
+`xxxxxxxxxxxx-compute@developer.gserviceaccount.com` is the service account you specified in this plugin. This
+means the temporary bucket you specified in this plugin doesn't exist. CDF/CDAP is trying to create the temporary bucket,
+but the specified service account doesn't have the permission. You must grant "GCE Storage Bucket Admin" role on the
+project identified by the `Project ID` you specified in this plugin to the service account. If you think you already
+granted the role, check if you granted the role to the wrong project (for example the one identified by the 
+`Dataset Project ID`).
+
+**missing permission to run BigQuery jobs**
+
+If your pipeline failed with the following error in the log:
+```
+POST https://bigquery.googleapis.com/bigquery/v2/projects/xxxx/jobs
+{
+"code" : 403,
+"errors" : [ {
+"domain" : "global",
+"message" : "Access Denied: Project xxxx: User does not have bigquery.jobs.create permission in project xxxx",
+"reason" : "accessDenied"
+} ],
+"message" : "Access Denied: Project xxxx: User does not have bigquery.jobs.create permission in project xxxx.",
+"status" : "PERMISSION_DENIED"
+}
+``` 
+`xxxx` is the `Project ID` you specified in this plugin. This means the specified service account doesn't have the
+permission to run BigQuery jobs. You must grant "BigQuery Job User" role on the project identified by the `Project ID`
+you specified in this plugin to the service account. If you think you already granted the role, check if you granted the
+role on the wrong project (for example the one identified by the `Dataset Project ID`).
+
+**missing permission to create the BigQuery dataset**
+
+If your pipeline failed with the following error in the log:
+```
+POST https://www.googleapis.com/bigquery/v2/projects/xxxx/datasets?prettyPrint=false
+{
+  "code" : 403,
+  "errors" : [ {
+    "domain" : "global",
+    "message" : "Access Denied: Project xxxx: User does not have bigquery.datasets.create permission in project xxxx.",
+    "reason" : "accessDenied"
+  } ],
+  "message" : "Access Denied: Project xxxx: User does not have bigquery.datasets.create permission in project xxxx.",
+  "status" : "PERMISSION_DENIED"
+}
+``` 
+`xxxx` is the `Dataset Project ID` you specified in this plugin. This means the dataset specified in this plugin doesn't
+exist. CDF/CDAP is trying to create the dataset but the service account you specified in this plugin doesn't have the permission.
+You must grant "BigQuery Data Editor" role on the project identified by the `Dataset Project ID` you specified in this
+plugin to the service account. If you think you already granted the role, check if you granted the role on the wrong
+project (for example the one identified by the `Project ID`).
+
+**missing permission to create the BigQuery table**
+If your pipeline failed with the following error in the log:
+```
+POST https://bigquery.googleapis.com/bigquery/v2/projects/xxxx/jobs
+{
+"code" : 403,
+"errors" : [ {
+"domain" : "global",
+"message" : "Access Denied: Dataset xxxx:mysql_bq_perm: Permission bigquery.tables.create denied on dataset xxxx:mysql_bq_perm (or it may not exist).",
+"reason" : "accessDenied"
+} ],
+"message" : "Access Denied: Dataset xxxx:mysql_bq_perm: Permission bigquery.tables.create denied on dataset xxxx:mysql_bq_perm (or it may not exist).",
+"status" : "PERMISSION_DENIED"
+}
+```
+`xxxx` is the `Dataset Project ID` you specified in this plugin. This means the table specified in this plugin doesn't
+exist. CDF/CDAP is trying to create the table but the service account you specified in this plugin doesn't have the permission.
+You must grant "BigQuery Data Editor" role on the project identified by the `Dataset Project ID` you specified in this
+plugin to the service account. If you think you already granted the role, check if you granted the role on the wrong
+project (for example the one identified by the `Project ID`).
+
+**missing permission to read the BigQuery dataset**
+If your pipeline failed with the following error in the log:
+```
+com.google.api.client.googleapis.json.GoogleJsonResponseException: 403 Forbidden
+GET https://www.googleapis.com/bigquery/v2/projects/xxxx/datasets/mysql_bq_perm?prettyPrint=false
+{
+"code" : 403,
+"errors" : [ {
+"domain" : "global",
+"message" : "Access Denied: Dataset xxxx:mysql_bq_perm: Permission bigquery.datasets.get denied on dataset xxxx:mysql_bq_perm (or it may not exist).",
+"reason" : "accessDenied"
+} ],
+"message" : "Access Denied: Dataset xxxx:mysql_bq_perm: Permission bigquery.datasets.get denied on dataset xxxx:mysql_bq_perm (or it may not exist).",
+"status" : "PERMISSION_DENIED"
+}
+```
+`xxxx` is the `Dataset Project ID` you specified in this plugin. The service account you specified in this plugin doesn't
+have the permission to read the dataset you specified in this plugin. You must grant "BigQuery Data Editor" role on the
+project identified by the `Dataset Project ID` you specified in this plugin to the service account. If you think you
+already granted the role, check if you granted the role on the wrong project (for example the one identified by the `Project ID`).

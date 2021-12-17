@@ -19,6 +19,8 @@ import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.Table;
 import com.google.common.annotations.VisibleForTesting;
 import io.cdap.cdap.api.annotation.Description;
+import io.cdap.cdap.api.annotation.Metadata;
+import io.cdap.cdap.api.annotation.MetadataProperty;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.annotation.Plugin;
 import io.cdap.cdap.api.data.batch.Output;
@@ -29,11 +31,14 @@ import io.cdap.cdap.etl.api.FailureCollector;
 import io.cdap.cdap.etl.api.PipelineConfigurer;
 import io.cdap.cdap.etl.api.batch.BatchSink;
 import io.cdap.cdap.etl.api.batch.BatchSinkContext;
+import io.cdap.cdap.etl.api.connector.Connector;
+import io.cdap.plugin.gcp.bigquery.connector.BigQueryConnector;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryConstants;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
 import org.apache.hadoop.conf.Configuration;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -42,11 +47,13 @@ import java.util.regex.Pattern;
  * This plugin allows users to write {@link StructuredRecord} entries to multiple Google Big Query tables.
  */
 @Plugin(type = BatchSink.PLUGIN_TYPE)
-@Name("BigQueryMultiTable")
+@Name(BigQueryMultiSink.NAME)
 @Description("Writes records to one or more Big Query tables. "
   + "BigQuery is Google's serverless, highly scalable, enterprise data warehouse. "
   + "Data is first written to a temporary location on Google Cloud Storage, then loaded into BigQuery from there.")
+@Metadata(properties = {@MetadataProperty(key = Connector.PLUGIN_TYPE, value = BigQueryConnector.NAME)})
 public class BigQueryMultiSink extends AbstractBigQuerySink {
+  public static final String NAME = "BigQueryMultiTable";
   private static final String TABLE_PREFIX = "multisink.";
   private static final String OUTPUT_PATTERN = "[A-Za-z0-9_-]+";
   private final BigQueryMultiSinkConfig config;
@@ -69,7 +76,7 @@ public class BigQueryMultiSink extends AbstractBigQuerySink {
   @Override
   protected void prepareRunValidation(BatchSinkContext context) {
     FailureCollector collector = context.getFailureCollector();
-    config.validate(collector);
+    config.validate(collector, context.getArguments().asMap());
     collector.getOrThrowException();
   }
 
@@ -111,7 +118,7 @@ public class BigQueryMultiSink extends AbstractBigQuerySink {
         Schema configuredSchema = Schema.parseJson(argument.getValue());
 
         Table table = BigQueryUtil.getBigQueryTable(
-          config.getProject(), config.getDataset(), tableName, config.getServiceAccount(),
+          config.getDatasetProject(), config.getDataset(), tableName, config.getServiceAccount(),
           config.isServiceAccountFilePath(), collector);
 
         Schema tableSchema = configuredSchema;
@@ -137,11 +144,10 @@ public class BigQueryMultiSink extends AbstractBigQuerySink {
                                            String bucket) throws IOException {
     Configuration conf = getOutputConfiguration();
     String splitField = config.getSplitField();
-    String bucketName = config.getBucket();
     String projectName = config.getDatasetProject();
     String datasetName = config.getDataset();
     context.addOutput(Output.of(config.getReferenceName(),
-                                new DelegatingMultiSinkOutputFormatProvider(conf, splitField, bucketName,
+                                new DelegatingMultiSinkOutputFormatProvider(conf, splitField, bucket,
                                                                             projectName, datasetName)));
   }
 

@@ -20,7 +20,7 @@
 
   <groupId>io.cdap.plugin</groupId>
   <artifactId>google-cloud</artifactId>
-  <version>0.18.0-SNAPSHOT</version>
+  <version>0.20.0-SNAPSHOT</version>
   <name>Google Cloud Plugins</name>
   <packaging>jar</packaging>
   <description>Plugins for Google Big Query</description>
@@ -72,17 +72,18 @@
     <avro.version>1.8.2</avro.version>
     <bigquery.connector.hadoop2.version>hadoop2-1.0.0</bigquery.connector.hadoop2.version>
     <commons.codec.version>1.4</commons.codec.version>
-    <cdap.version>6.5.0-SNAPSHOT</cdap.version>
-    <cdap.plugin.version>2.7.0-SNAPSHOT</cdap.plugin.version>
+    <cdap.version>6.7.0-SNAPSHOT</cdap.version>
+    <cdap.plugin.version>2.9.0-SNAPSHOT</cdap.plugin.version>
     <dropwizard.metrics-core.version>3.2.6</dropwizard.metrics-core.version>
     <flogger.system.backend.version>0.3.1</flogger.system.backend.version>
     <gcs.connector.version>hadoop2-2.0.0</gcs.connector.version>
     <google.cloud.bigtable.version>1.17.1</google.cloud.bigtable.version>
-    <google.cloud.bigquery.version>1.125.0</google.cloud.bigquery.version>
+    <google.cloud.bigquery.version>1.137.1</google.cloud.bigquery.version>
+    <google.cloud.kms.version>2.0.2</google.cloud.kms.version>
     <google.cloud.pubsub.version>1.108.1</google.cloud.pubsub.version>
-    <google.cloud.spanner.version>3.0.4</google.cloud.spanner.version>
+    <google.cloud.spanner.version>6.10.1</google.cloud.spanner.version>
     <google.cloud.speech.version>1.24.7</google.cloud.speech.version>
-    <google.cloud.storage.version>1.111.2</google.cloud.storage.version>
+    <google.cloud.storage.version>1.118.0</google.cloud.storage.version>
     <google.cloud.datastore.version>1.105.1</google.cloud.datastore.version>
     <google.protobuf.java.version>3.13.0</google.protobuf.java.version>
     <google.tink.version>1.3.0-rc3</google.tink.version>
@@ -96,6 +97,9 @@
     <powermock.version>2.0.2</powermock.version>
     <slf4j.version>1.7.5</slf4j.version>
     <spark.version>2.3.1</spark.version>
+    <spark3.version>3.1.1</spark3.version>
+    <spark-bq-connector.version>0.23.1</spark-bq-connector.version>
+    <testSourceLocation>${project.basedir}/src/test/java/</testSourceLocation>
   </properties>
 
   <dependencyManagement>
@@ -103,7 +107,12 @@
       <dependency>
         <groupId>com.google.apis</groupId>
         <artifactId>google-api-services-bigquery</artifactId>
-        <version>v2-rev20200324-1.30.9</version>
+        <version>v2-rev20210617-1.32.1</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.apis</groupId>
+        <artifactId>google-api-services-storage</artifactId>
+        <version>v1-rev20210127-1.32.1</version>
       </dependency>
     </dependencies>
   </dependencyManagement>
@@ -401,6 +410,11 @@
       <version>${gcs.connector.version}</version>
     </dependency>
     <dependency>
+      <groupId>com.google.cloud</groupId>
+      <artifactId>google-cloud-kms</artifactId>
+      <version>${google.cloud.kms.version}</version>
+    </dependency>
+    <dependency>
       <groupId>com.google.protobuf</groupId>
       <artifactId>protobuf-java</artifactId>
       <version>${google.protobuf.java.version}</version>
@@ -553,10 +567,49 @@
       <artifactId>httpclient</artifactId>
       <version>${httpclient.version}</version>
     </dependency>
-
+    <!-- Start: dependencies used by the Spark-BigQuery connector -->
+    <dependency>
+      <groupId>io.cdap.cdap</groupId>
+      <artifactId>cdap-etl-api-spark</artifactId>
+      <version>${cdap.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.cdap.cdap</groupId>
+      <artifactId>cdap-api-spark2_2.11</artifactId>
+      <version>${cdap.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.google.cloud.spark</groupId>
+      <artifactId>spark-bigquery-with-dependencies_2.12</artifactId>
+      <version>${spark-bq-connector.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>javax.inject</groupId>
+      <artifactId>javax.inject</artifactId>
+      <version>1</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_2.12</artifactId>
+      <version>${spark3.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-log4j12</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>log4j</groupId>
+          <artifactId>log4j</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <!-- End: dependencies used by the Spark-BigQuery connector -->
   </dependencies>
 
   <build>
+    <testSourceDirectory>${testSourceLocation}</testSourceDirectory>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -573,6 +626,10 @@
               <consoleOutput>true</consoleOutput>
               <failsOnError>true</failsOnError>
               <includeTestSourceDirectory>true</includeTestSourceDirectory>
+              <testSourceDirectories>
+                <testSourceDirectory>src/test/java</testSourceDirectory>
+                <testSourceDirectory>src/e2e-test/java</testSourceDirectory>
+              </testSourceDirectories>
             </configuration>
             <goals>
               <goal>check</goal>
@@ -633,6 +690,9 @@
               org.apache.spark.streaming.pubsub*;
               org.apache.hadoop.hbase.mapreduce.*;
               org.apache.hadoop.hbase.security.token.*;
+              com.google.cloud.spark.bigquery.*;
+              org.apache.spark.sql.*;
+              org.apache.spark.internal.*;
             </_exportcontents>
           </instructions>
         </configuration>
@@ -652,8 +712,8 @@
         <version>1.1.0</version>
         <configuration>
           <cdapArtifacts>
-            <parent>system:cdap-data-pipeline[6.3.0-SNAPSHOT,7.0.0-SNAPSHOT)</parent>
-            <parent>system:cdap-data-streams[6.3.0-SNAPSHOT,7.0.0-SNAPSHOT)</parent>
+            <parent>system:cdap-data-pipeline[6.7.0-SNAPSHOT,7.0.0-SNAPSHOT)</parent>
+            <parent>system:cdap-data-streams[6.7.0-SNAPSHOT,7.0.0-SNAPSHOT)</parent>
           </cdapArtifacts>
         </configuration>
         <executions>
@@ -781,6 +841,81 @@
           </plugin>
         </plugins>
       </build>
+    </profile>
+
+    <profile>
+      <id>e2e-tests</id>
+      <properties>
+        <testSourceLocation>src/e2e-test/java</testSourceLocation>
+      </properties>
+      <build>
+      <plugins>
+        <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>2.18.1</version>
+        <configuration>
+          <skipTests>true</skipTests>
+        </configuration>
+        </plugin>
+
+        <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <version>3.0.0-M5</version>
+        <configuration>
+          <includes>
+            <include>TestRunner.java</include>
+          </includes>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+            </goals>
+          </execution>
+        </executions>
+        </plugin>
+
+        <plugin>
+        <groupId>net.masterthought</groupId>
+        <artifactId>maven-cucumber-reporting</artifactId>
+        <version>5.5.0</version>
+
+        <executions>
+          <execution>
+            <id>execution</id>
+            <phase>verify</phase>
+            <goals>
+              <goal>generate</goal>
+            </goals>
+            <configuration>
+              <projectName>Cucumber Reports</projectName> <!-- Replace with project name -->
+              <outputDirectory>target/cucumber-reports/advanced-reports</outputDirectory>
+              <buildNumber>1</buildNumber>
+              <skip>false</skip>
+              <inputDirectory>${project.build.directory}/cucumber-reports</inputDirectory>
+              <jsonFiles> <!-- supports wildcard or name pattern -->
+                <param>**/*.json</param>
+              </jsonFiles> <!-- optional, defaults to outputDirectory if not specified -->
+              <classificationDirectory>${project.build.directory}/cucumber-reports</classificationDirectory>
+              <checkBuildResult>true</checkBuildResult>
+            </configuration>
+          </execution>
+        </executions>
+        </plugin>
+      </plugins>
+      </build>
+
+      <dependencies>
+        <dependency>
+          <groupId>io.cdap.tests.e2e</groupId>
+          <artifactId>cdap-e2e-framework</artifactId>
+          <version>0.0.1-SNAPSHOT</version>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+
     </profile>
   </profiles>
 </project>

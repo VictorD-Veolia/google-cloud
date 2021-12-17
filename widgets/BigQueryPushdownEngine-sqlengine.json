@@ -1,0 +1,190 @@
+{
+  "metadata": {
+    "spec-version": "1.5"
+  },
+  "display-name": "BigQuery Pushdown",
+  "configuration-groups": [
+    {
+      "label": "Basic",
+      "properties": [
+        {
+          "widget-type": "textbox",
+          "label": "BigQuery Dataset",
+          "name": "dataset",
+          "widget-attributes": {
+            "placeholder": "Dataset to use to store temporary tables when pipeline is run."
+          }
+        }
+      ]
+    },
+    {
+      "label": "Credentials",
+      "properties": [
+        {
+          "name": "serviceAccountType",
+          "label": "Service Account Type",
+          "widget-type": "radio-group",
+          "widget-attributes": {
+            "layout": "inline",
+            "default": "filePath",
+            "options": [
+              {
+                "id": "filePath",
+                "label": "File Path"
+              },
+              {
+                "id": "JSON",
+                "label": "JSON"
+              }
+            ]
+          }
+        },
+        {
+          "widget-type": "textbox",
+          "label": "Service Account File Path",
+          "name": "serviceFilePath",
+          "widget-attributes": {
+            "default": "auto-detect"
+          }
+        },
+        {
+          "widget-type": "textbox",
+          "label": "Service Account JSON",
+          "name": "serviceAccountJSON"
+        }
+      ]
+    },
+    {
+      "label": "Advanced",
+      "properties": [
+        {
+          "widget-type": "textbox",
+          "label": "Project ID",
+          "name": "project",
+          "widget-attributes": {
+            "default": "auto-detect"
+          }
+        },
+        {
+          "widget-type": "textbox",
+          "label": "Dataset Project ID",
+          "name": "datasetProject",
+          "widget-attributes": {
+            "placeholder": "Project in which the dataset is located or should be created. Defaults to Project ID."
+          }
+        },
+        {
+          "widget-type": "textbox",
+          "label": "Temporary Bucket Name",
+          "name": "bucket",
+          "widget-attributes": {
+            "placeholder": "Google Cloud Storage bucket for temporary data"
+          }
+        },
+        {
+          "widget-type": "textbox",
+          "label": "Location",
+          "name": "location",
+          "widget-attributes": {
+            "default": "US"
+          }
+        },
+        {
+          "widget-type": "textbox",
+          "label": "Encryption Key Name",
+          "name": "cmekKey",
+          "widget-attributes": {
+            "placeholder": "projects/<gcp-project-id>/locations/<key-location>/keyRings/<key-ring-name>/cryptoKeys/<key-name>"
+          }
+        },
+        {
+          "widget-type": "toggle",
+          "label": "Retain BigQuery tables after completion",
+          "name": "retainTables",
+          "widget-attributes": {
+            "on": {
+              "value": "true",
+              "label": "YES"
+            },
+            "off": {
+              "value": "false",
+              "label": "NO"
+            },
+            "default": "false"
+          }
+        },
+        {
+          "name": "tempTableTTLHours",
+          "widget-type": "number",
+          "label": "Temporary Table TTL (in Hours)",
+          "widget-attributes": {
+            "min": "1",
+            "default": "72"
+          }
+        },
+        {
+          "widget-type": "radio-group",
+          "label": "Job Priority",
+          "name": "jobPriority",
+          "widget-attributes": {
+            "layout": "inline",
+            "default": "batch",
+            "options": [
+              {
+                "id": "batch",
+                "label": "Batch"
+              },
+              {
+                "id": "interactive",
+                "label": "Interactive"
+              }
+            ]
+          }
+        },
+        {
+          "widget-type": "toggle",
+          "label": "Use BigQuery Storage Read API",
+          "name": "useStorageReadAPI",
+          "widget-attributes": {
+            "on": {
+              "value": "true",
+              "label": "YES"
+            },
+            "off": {
+              "value": "false",
+              "label": "NO"
+            },
+            "default": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "outputs": [],
+  "filters": [
+    {
+      "name": "ServiceAuthenticationTypeFilePath",
+      "condition": {
+        "expression": "serviceAccountType == 'filePath'"
+      },
+      "show": [
+        {
+          "type": "property",
+          "name": "serviceFilePath"
+        }
+      ]
+    },
+    {
+      "name": "ServiceAuthenticationTypeJSON",
+      "condition": {
+        "expression": "serviceAccountType == 'JSON'"
+      },
+      "show": [
+        {
+          "type": "property",
+          "name": "serviceAccountJSON"
+        }
+      ]
+    }
+  ]
+}

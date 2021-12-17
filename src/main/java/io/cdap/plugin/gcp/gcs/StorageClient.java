@@ -17,6 +17,7 @@
 package io.cdap.plugin.gcp.gcs;
 
 import com.google.api.gax.paging.Page;
+import com.google.cloud.kms.v1.CryptoKeyName;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobInfo;
@@ -26,6 +27,7 @@ import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageException;
 import com.google.cloud.storage.StorageOptions;
 import com.google.common.annotations.VisibleForTesting;
+import io.cdap.plugin.gcp.common.GCPConnectorConfig;
 import io.cdap.plugin.gcp.common.GCPUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -106,6 +108,27 @@ public class StorageClient {
   }
 
   /**
+   * Creates the given bucket if it does not exists.
+   *
+   * @param path the path of the bucket 
+   * @param location the location of bucket
+   * @param cmekKeyName  the name of the cmek key
+   */
+  public void createBucketIfNotExists(GCSPath path, @Nullable String location, @Nullable CryptoKeyName cmekKeyName) {
+    Bucket bucket = null;
+    try {
+      bucket = storage.get(path.getBucket());
+    } catch (StorageException e) {
+      throw new RuntimeException(
+        String.format("Unable to access bucket %s. ", path.getBucket())
+          + "Ensure you entered the correct bucket path and have permissions for it.", e);
+    }
+    if (bucket == null) {
+      GCPUtils.createBucket(storage, path.getBucket(), location, cmekKeyName);
+    }
+  }
+
+  /**
    * Copy objects from the source path to the destination path. If the source path is a single object, that object
    * will be copied to the destination. If the source path represents a directory, objects within the directory
    * will be copied to the destination directory.
@@ -115,66 +138,9 @@ public class StorageClient {
    * @param recursive whether to copy objects in all subdirectories
    * @param overwrite whether to overwrite existing objects
    * @throws IllegalArgumentException if overwrite is false and copying would overwrite an existing object
-   * @return copied blob object from google bucket storage or null if we are dealing with a directory/bucket
    */
-  public Blob copy(GCSPath sourcePath, GCSPath destPath, boolean recursive, boolean overwrite) {
-    // If sourcePath is not a bucket and sourcePath doesn't end with "/"
-    // For example: gs://plugin_376/csvexample.csv
-    // It means we are dealing with a single object which can be copied to the destination
-    if (!sourcePath.isBucket() && !sourcePath.getName().endsWith("/")) {
-      return copyObjectToDestination(sourcePath, destPath, overwrite);
-    }
+  public void copy(GCSPath sourcePath, GCSPath destPath, boolean recursive, boolean overwrite) {
     pairTraverse(sourcePath, destPath, recursive, overwrite, BlobPair::copy);
-    return null;
-  }
-
-  /**
-   * Copy a single object from the source path to the destination path.
-   *
-   * @param sourcePath the path to copy object from
-   * @param destPath   the path to copy object to
-   * @param overwrite  whether to overwrite existing object
-   * @throws RuntimeException if overwrite is false and copying would overwrite an existing object
-   * @return copied blob object from google bucket storage
-   */
-  private Blob copyObjectToDestination(GCSPath sourcePath, GCSPath destPath, boolean overwrite) {
-    Blob sourceBlob;
-    try {
-      sourceBlob = storage.get(sourcePath.getBucket(), sourcePath.getName());
-      if (sourceBlob == null) {
-        throw new RuntimeException(
-          String.format("Object %s. not found", sourcePath.getUri())
-            + "Ensure you entered the correct path.");
-      }
-    } catch (StorageException e) {
-      throw new RuntimeException(
-        String.format("Unable to access source bucket %s. ", sourcePath.getBucket())
-          + "Ensure you entered the correct bucket path.", e);
-    }
-
-    boolean destinationObjectExists = false;
-    String destinationPath = String.format("%s%s", destPath.getName(), sourcePath.getName());
-    if (storage.get(BlobId.of(destPath.getBucket(), destinationPath)) != null) {
-      destinationObjectExists = true;
-    }
-
-    final BlobId destination = BlobId.of(destPath.getBucket(), append(destPath.getName(), sourcePath.getName()));
-    if (!overwrite && destinationObjectExists) {
-      throw new IllegalArgumentException(String.format("%s already exists.", toPath(destination)));
-    }
-
-    LOG.debug("Copying {} to {}.", toPath(sourceBlob.getBlobId()), toPath(destination));
-    Blob copied;
-    try {
-      CopyWriter copyWriter = sourceBlob.copyTo(destination);
-      copied = copyWriter.getResult();
-      LOG.debug("Successfully copied {} to {}.", toPath(sourceBlob.getBlobId()), toPath(destination));
-    } catch (StorageException e) {
-      throw new RuntimeException(
-        String.format("Unable to access source bucket %s. ", destPath.getBucket())
-          + "Ensure you entered the correct bucket path.", e);
-    }
-    return copied;
   }
 
   /**
@@ -187,67 +153,9 @@ public class StorageClient {
    * @param recursive whether to move objects in all subdirectories
    * @param overwrite whether to overwrite existing objects
    * @throws IllegalArgumentException if overwrite is false and moving would overwrite an existing object
-   * @return moved blob object from google bucket storage or null if we are dealing with a directory/bucket
    */
-  public Blob move(GCSPath sourcePath, GCSPath destPath, boolean recursive, boolean overwrite) {
-    // If sourcePath is not a bucket and sourcePath doesn't end with "/"
-    // For example: gs://plugin_376/simple_message
-    // It means we are dealing with a single object which can be moved to the destination
-    if (!sourcePath.isBucket() && !sourcePath.getName().endsWith("/")) {
-      return moveObjectToDestination(sourcePath, destPath, overwrite);
-    }
+  public void move(GCSPath sourcePath, GCSPath destPath, boolean recursive, boolean overwrite) {
     pairTraverse(sourcePath, destPath, recursive, overwrite, BlobPair::move);
-    return null;
-  }
-
-  /**
-   * Moves a single object from the source path to the destination path.
-   *
-   * @param sourcePath the path to move object from
-   * @param destPath   the path to move object to
-   * @param overwrite  whether to overwrite existing object
-   * @throws RuntimeException if overwrite is false and moving would overwrite an existing object
-   * @return moved blob object from google bucket storage
-   */
-  private Blob moveObjectToDestination(GCSPath sourcePath, GCSPath destPath, boolean overwrite) {
-    Blob sourceBlob;
-    try {
-      sourceBlob = storage.get(sourcePath.getBucket(), sourcePath.getName());
-      if (sourceBlob == null) {
-        throw new RuntimeException(
-          String.format("Object %s. not found", sourcePath.getUri())
-            + "Ensure you entered the correct path.");
-      }
-    } catch (StorageException e) {
-      throw new RuntimeException(
-        String.format("Unable to access source bucket %s. ", sourcePath.getBucket())
-          + "Ensure you entered the correct bucket path.", e);
-    }
-
-    boolean destinationObjectExists = false;
-    String destinationPath = String.format("%s%s", destPath.getName(), sourcePath.getName());
-    if (storage.get(BlobId.of(destPath.getBucket(), destinationPath)) != null) {
-      destinationObjectExists = true;
-    }
-
-    final BlobId destination = BlobId.of(destPath.getBucket(), append(destPath.getName(), sourcePath.getName()));
-    if (!overwrite && destinationObjectExists) {
-      throw new IllegalArgumentException(String.format("%s already exists.", toPath(destination)));
-    }
-
-    LOG.debug("Moving {} to {}.", toPath(sourceBlob.getBlobId()), toPath(destination));
-    Blob moved;
-    try {
-      CopyWriter copyWriter = sourceBlob.copyTo(destination);
-      moved = copyWriter.getResult();
-      sourceBlob.delete();
-      LOG.debug("Successfully moved {} to {}.", toPath(sourceBlob.getBlobId()), toPath(destination));
-    } catch (StorageException e) {
-      throw new RuntimeException(
-        String.format("Unable to access source bucket %s. ", destPath.getBucket())
-          + "Ensure you entered the correct bucket path.", e);
-    }
-    return moved;
   }
 
   /**
@@ -415,6 +323,10 @@ public class StorageClient {
     }
     Storage storage = builder.build().getService();
     return new StorageClient(storage);
+  }
+
+  public static StorageClient create(GCPConnectorConfig config) throws IOException {
+    return create(config.getProject(), config.getServiceAccount(), config.isServiceAccountFilePath());
   }
 
   /**

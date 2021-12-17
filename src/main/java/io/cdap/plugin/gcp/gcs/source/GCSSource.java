@@ -21,13 +21,20 @@ import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
+import io.cdap.cdap.api.annotation.Metadata;
+import io.cdap.cdap.api.annotation.MetadataProperty;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.annotation.Plugin;
 import io.cdap.cdap.api.data.schema.Schema;
+import io.cdap.cdap.api.plugin.PluginConfig;
 import io.cdap.cdap.etl.api.FailureCollector;
 import io.cdap.cdap.etl.api.PipelineConfigurer;
 import io.cdap.cdap.etl.api.batch.BatchSource;
 import io.cdap.cdap.etl.api.batch.BatchSourceContext;
+import io.cdap.cdap.etl.api.connector.Connector;
+import io.cdap.plugin.common.ConfigUtil;
+import io.cdap.plugin.common.Constants;
+import io.cdap.plugin.common.IdUtils;
 import io.cdap.plugin.common.LineageRecorder;
 import io.cdap.plugin.format.FileFormat;
 import io.cdap.plugin.format.charset.fixedlength.FixedLengthCharset;
@@ -35,10 +42,12 @@ import io.cdap.plugin.format.input.PathTrackingInputFormat;
 import io.cdap.plugin.format.plugin.AbstractFileSource;
 import io.cdap.plugin.format.plugin.AbstractFileSourceConfig;
 import io.cdap.plugin.format.plugin.FileSourceProperties;
-import io.cdap.plugin.gcp.common.GCPReferenceSourceConfig;
+import io.cdap.plugin.gcp.common.GCPConnectorConfig;
 import io.cdap.plugin.gcp.common.GCPUtils;
 import io.cdap.plugin.gcp.crypto.EncryptedFileSystem;
+import io.cdap.plugin.gcp.gcs.Formats;
 import io.cdap.plugin.gcp.gcs.GCSPath;
+import io.cdap.plugin.gcp.gcs.connector.GCSConnector;
 
 import java.lang.reflect.Type;
 import java.util.Collections;
@@ -54,6 +63,7 @@ import javax.annotation.Nullable;
 @Plugin(type = BatchSource.PLUGIN_TYPE)
 @Name(GCSSource.NAME)
 @Description("Reads objects from a path in a Google Cloud Storage bucket.")
+@Metadata(properties = {@MetadataProperty(key = Connector.PLUGIN_TYPE, value = GCSConnector.NAME)})
 public class GCSSource extends AbstractFileSource<GCSSource.GCSSourceConfig> {
   public static final String NAME = "GCSFile";
   private final GCSSourceConfig config;
@@ -70,7 +80,7 @@ public class GCSSource extends AbstractFileSource<GCSSource.GCSSourceConfig> {
 
   @Override
   protected Map<String, String> getFileSystemProperties(BatchSourceContext context) {
-    Map<String, String> properties = GCPUtils.getFileSystemProperties(config, config.getPath(),
+    Map<String, String> properties = GCPUtils.getFileSystemProperties(config.connection, config.getPath(),
                                                                       new HashMap<>(config.getFileSystemProperties()));
     if (config.isCopyHeader()) {
       properties.put(PathTrackingInputFormat.COPY_HEADER, Boolean.TRUE.toString());
@@ -99,28 +109,33 @@ public class GCSSource extends AbstractFileSource<GCSSource.GCSSourceConfig> {
 
   @Override
   protected boolean shouldGetSchema() {
-    return !config.containsMacro(GCSSourceConfig.NAME_PROJECT) && !config.containsMacro(GCSSourceConfig.NAME_PATH) &&
-      !config.containsMacro(GCSSourceConfig.NAME_FORMAT) && !config.containsMacro(GCSSourceConfig.NAME_DELIMITER) &&
-      !config.containsMacro(GCSSourceConfig.NAME_FILE_SYSTEM_PROPERTIES) &&
-      !config.containsMacro(GCSSourceConfig.NAME_SERVICE_ACCOUNT_FILE_PATH) &&
-      !config.containsMacro(GCSSourceConfig.NAME_SERVICE_ACCOUNT_JSON);
+    return !config.containsMacro(GCPConnectorConfig.NAME_PROJECT) &&
+             !config.containsMacro(GCSSourceConfig.NAME_PATH) && !config.containsMacro(GCSSourceConfig.NAME_FORMAT) &&
+             !config.containsMacro(GCSSourceConfig.NAME_DELIMITER) &&
+             !config.containsMacro(GCSSourceConfig.NAME_FILE_SYSTEM_PROPERTIES) &&
+             !config.containsMacro(GCPConnectorConfig.NAME_SERVICE_ACCOUNT_FILE_PATH) &&
+             !config.containsMacro(GCPConnectorConfig.NAME_SERVICE_ACCOUNT_JSON);
   }
 
   /**
    * Config for the plugin.
    */
   @SuppressWarnings("ConstantConditions")
-  public static class GCSSourceConfig extends GCPReferenceSourceConfig implements FileSourceProperties {
-    private static final String NAME_PATH = "path";
+  public static class GCSSourceConfig extends PluginConfig implements FileSourceProperties {
+    public static final String NAME_PATH = "path";
+    public static final String NAME_FORMAT = "format";
     private static final String NAME_FILE_SYSTEM_PROPERTIES = "fileSystemProperties";
     private static final String NAME_FILE_REGEX = "fileRegex";
-    private static final String NAME_FORMAT = "format";
     private static final String NAME_DELIMITER = "delimiter";
 
     private static final String DEFAULT_ENCRYPTED_METADATA_SUFFIX = ".metadata";
 
     private static final Gson GSON = new Gson();
     private static final Type MAP_STRING_STRING_TYPE = new TypeToken<Map<String, String>>() { }.getType();
+
+    @Name(Constants.Reference.REFERENCE_NAME)
+    @Description("This will be used to uniquely identify this source for lineage, annotating metadata, etc.")
+    public String referenceName;
 
     @Macro
     @Description("The path to read from. For example, gs://<bucket>/path/to/directory/")
@@ -224,6 +239,17 @@ public class GCSSource extends AbstractFileSource<GCSSource.GCSSourceConfig> {
     @Description("The maximum number of rows that will get investigated for automatic data type detection.")
     private Long sampleSize;
 
+    @Name(ConfigUtil.NAME_USE_CONNECTION)
+    @Nullable
+    @Description("Whether to use an existing connection.")
+    private Boolean useConnection;
+
+    @Name(ConfigUtil.NAME_CONNECTION)
+    @Macro
+    @Nullable
+    @Description("The existing connection to use.")
+    private GCPConnectorConfig connection;
+
     public GCSSourceConfig() {
       this.maxSplitSize = 128L * 1024 * 1024;
       this.recursive = false;
@@ -232,7 +258,8 @@ public class GCSSource extends AbstractFileSource<GCSSource.GCSSourceConfig> {
     }
 
     public void validate(FailureCollector collector) {
-      super.validate(collector);
+      IdUtils.validateReferenceName(referenceName, collector);
+      ConfigUtil.validateConnection(this, useConnection, connection, collector);
       // validate that path is valid
       if (!containsMacro(NAME_PATH)) {
         try {
@@ -258,20 +285,17 @@ public class GCSSource extends AbstractFileSource<GCSSource.GCSSourceConfig> {
             .withStacktrace(e.getStackTrace());
         }
       }
-      if (!containsMacro(NAME_FORMAT)) {
-        try {
-          getFormat();
-        } catch (IllegalArgumentException e) {
-          collector.addFailure(e.getMessage(), null).withConfigProperty(NAME_FORMAT)
-            .withStacktrace(e.getStackTrace());
-        }
-      }
 
       if (fileEncoding != null && !fileEncoding.equals(AbstractFileSourceConfig.DEFAULT_FILE_ENCODING)
         && !FixedLengthCharset.isValidEncoding(fileEncoding)) {
         collector.addFailure("Specified file encoding is not valid.",
                              "Use one of the supported file encodings.");
       }
+    }
+
+    @Override
+    public String getFormatName() {
+      return Formats.getFormatPluginName(format);
     }
 
     @Override
@@ -282,11 +306,6 @@ public class GCSSource extends AbstractFileSource<GCSSource.GCSSourceConfig> {
     @Override
     public String getPath() {
       return path;
-    }
-
-    @Override
-    public FileFormat getFormat() {
-      return FileFormat.from(format, FileFormat::canRead);
     }
 
     @Nullable

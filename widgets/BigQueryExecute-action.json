@@ -68,6 +68,14 @@
         },
         {
           "widget-type": "textbox",
+          "label": "Dataset Project ID",
+          "name": "datasetProject",
+          "widget-attributes": {
+            "placeholder": "The project in which the dataset specified in the `Dataset Name` is located or should be created. Defaults to the project specified in the Project Id property."
+          }
+        },
+        {
+          "widget-type": "textbox",
           "label": "Dataset Name",
           "name": "dataset",
           "widget-attributes": {
@@ -105,6 +113,14 @@
           "widget-attributes": {
             "placeholder": "Location of the job.",
             "default": "US"
+          }
+        },
+        {
+          "widget-type": "textbox",
+          "label": "Encryption Key Name",
+          "name": "cmekKey",
+          "widget-attributes": {
+            "placeholder": "projects/<gcp-project-id>/locations/<key-location>/keyRings/<key-ring-name>/cryptoKeys/<key-name>"
           }
         },
         {

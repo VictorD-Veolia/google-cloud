@@ -26,6 +26,11 @@ Properties
 ----------
 **Reference Name:** Name used to uniquely identify this sink for lineage, annotating metadata, etc.
 
+**Use Connection** Whether to use a connection. If a connection is used, you do not need to provide the credentials.
+
+**Connection** Name of the connection to use. Project and service account information will be provided by the connection.
+You also can use the macro function ${conn(connection-name)}.
+
 **Project ID**: Google Cloud Project ID, which uniquely identifies a project.
 It can be found on the Dashboard in the Google Cloud Platform Console.
 
@@ -46,6 +51,9 @@ The delimiter will be ignored if the format is anything other than 'delimited'.
 **Write Header:** Whether to write a header to each file if the format is 'delimited', 'csv', or 'tsv'.
 
 **Location:** The location where the gcs bucket will get created. This value is ignored if the bucket already exists.
+
+**Encryption Key Name:** Used to encrypt data written to any bucket created by the plugin.
+If the bucket already exists, this is ignored.
 
 **Content Type:** The Content Type entity is used to indicate the media type of the resource.
 Defaults to 'application/octet-stream'. The following table shows valid content types for each format.

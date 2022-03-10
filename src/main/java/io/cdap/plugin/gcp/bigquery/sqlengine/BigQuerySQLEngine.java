@@ -28,10 +28,14 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import io.cdap.cdap.api.RuntimeContext;
 import io.cdap.cdap.api.annotation.Description;
+import io.cdap.cdap.api.annotation.Metadata;
+import io.cdap.cdap.api.annotation.MetadataProperty;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.annotation.Plugin;
 import io.cdap.cdap.api.data.format.StructuredRecord;
+import io.cdap.cdap.api.data.schema.Schema;
 import io.cdap.cdap.etl.api.PipelineConfigurer;
+import io.cdap.cdap.etl.api.connector.Connector;
 import io.cdap.cdap.etl.api.engine.sql.BatchSQLEngine;
 import io.cdap.cdap.etl.api.engine.sql.SQLEngineException;
 import io.cdap.cdap.etl.api.engine.sql.capability.DefaultPullCapability;
@@ -44,10 +48,25 @@ import io.cdap.cdap.etl.api.engine.sql.request.SQLJoinDefinition;
 import io.cdap.cdap.etl.api.engine.sql.request.SQLJoinRequest;
 import io.cdap.cdap.etl.api.engine.sql.request.SQLPullRequest;
 import io.cdap.cdap.etl.api.engine.sql.request.SQLPushRequest;
+import io.cdap.cdap.etl.api.engine.sql.request.SQLRelationDefinition;
+import io.cdap.cdap.etl.api.engine.sql.request.SQLTransformDefinition;
+import io.cdap.cdap.etl.api.engine.sql.request.SQLTransformRequest;
+import io.cdap.cdap.etl.api.engine.sql.request.SQLWriteRequest;
+import io.cdap.cdap.etl.api.engine.sql.request.SQLWriteResult;
 import io.cdap.cdap.etl.api.join.JoinCondition;
 import io.cdap.cdap.etl.api.join.JoinDefinition;
 import io.cdap.cdap.etl.api.join.JoinStage;
+import io.cdap.cdap.etl.api.relational.Capability;
+import io.cdap.cdap.etl.api.relational.Engine;
+import io.cdap.cdap.etl.api.relational.ExpressionFactory;
+import io.cdap.cdap.etl.api.relational.Relation;
+import io.cdap.cdap.etl.api.relational.StringExpressionFactoryType;
+import io.cdap.plugin.gcp.bigquery.connector.BigQueryConnector;
+import io.cdap.plugin.gcp.bigquery.relational.BigQueryRelation;
+import io.cdap.plugin.gcp.bigquery.relational.SQLExpressionFactory;
 import io.cdap.plugin.gcp.bigquery.sink.BigQuerySinkUtils;
+import io.cdap.plugin.gcp.bigquery.source.BigQuerySourceUtils;
+import io.cdap.plugin.gcp.bigquery.sqlengine.builder.BigQueryJoinSQLBuilder;
 import io.cdap.plugin.gcp.bigquery.sqlengine.util.BigQuerySQLEngineUtils;
 import io.cdap.plugin.gcp.bigquery.util.BigQueryUtil;
 import io.cdap.plugin.gcp.common.CmekUtils;
@@ -63,6 +82,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -77,8 +97,10 @@ import javax.annotation.Nullable;
 @Description("BigQuery SQLEngine implementation, used to push down certain pipeline steps into BigQuery. "
   + "A GCS bucket is used as staging for the read/write operations performed by this engine. "
   + "BigQuery is Google's serverless, highly scalable, enterprise data warehouse.")
+@Metadata(properties = {@MetadataProperty(key = Connector.PLUGIN_TYPE, value = BigQueryConnector.NAME)})
 public class BigQuerySQLEngine
-  extends BatchSQLEngine<LongWritable, GenericData.Record, StructuredRecord, NullWritable> {
+  extends BatchSQLEngine<LongWritable, GenericData.Record, StructuredRecord, NullWritable>
+  implements Engine {
 
   private static final Logger LOG = LoggerFactory.getLogger(BigQuerySQLEngine.class);
 
@@ -146,6 +168,9 @@ public class BigQuerySQLEngine
     // Configure GCS bucket that is used to stage temporary files.
     // If the bucket is created for this run, mar it for deletion after executon is completed
     BigQuerySinkUtils.configureBucket(configuration, bucket, runId, sqlEngineConfig.getBucket() == null);
+
+    // Configure credentials for the source
+    BigQuerySourceUtils.configureServiceAccount(configuration, sqlEngineConfig.connection);
   }
 
   @Override
@@ -182,7 +207,7 @@ public class BigQuerySQLEngine
 
       LOG.info("Executing Push operation for dataset {} stored in table {}",
                sqlPushRequest.getDatasetName(),
-               pushDataset.getBigQueryTableName());
+               pushDataset.getBigQueryTable());
 
       datasets.put(sqlPushRequest.getDatasetName(), pushDataset);
       return pushDataset;
@@ -199,7 +224,7 @@ public class BigQuerySQLEngine
                                                  sqlPullRequest.getDatasetName()));
     }
 
-    String table = datasets.get(sqlPullRequest.getDatasetName()).getBigQueryTableName();
+    String table = datasets.get(sqlPullRequest.getDatasetName()).getBigQueryTable();
 
     LOG.info("Executing Pull operation for dataset {} stored in table {}", sqlPullRequest.getDatasetName(), table);
 
@@ -269,21 +294,17 @@ public class BigQuerySQLEngine
 
   @Override
   public SQLDataset join(SQLJoinRequest sqlJoinRequest) throws SQLEngineException {
-    LOG.info("Executing join operation for dataset {}", sqlJoinRequest.getDatasetName());
+    // Get SQL builder for this Join operation
+    BigQueryJoinSQLBuilder builder = new BigQueryJoinSQLBuilder(
+      sqlJoinRequest.getJoinDefinition(),
+      DatasetId.of(datasetProject, dataset),
+      getStageNameToBQTableNameMap());
 
-    BigQueryJoinDataset joinDataset = BigQueryJoinDataset.getInstance(sqlJoinRequest,
-                                                                      getStageNameToBQTableNameMap(),
-                                                                      sqlEngineConfig,
-                                                                      bigQuery,
-                                                                      project,
-                                                                      DatasetId.of(datasetProject, dataset),
-                                                                      runId);
-
-    LOG.info("Executed join operation for dataset {}", sqlJoinRequest.getDatasetName());
-
-    datasets.put(sqlJoinRequest.getDatasetName(), joinDataset);
-
-    return joinDataset;
+    // Execute Select job with the supplied query.
+    return executeSelect(sqlJoinRequest.getDatasetName(),
+                         sqlJoinRequest.getJoinDefinition().getOutputSchema(),
+                         BigQueryJobType.JOIN,
+                         builder.getQuery());
   }
 
   @Nullable
@@ -294,9 +315,13 @@ public class BigQuerySQLEngine
       return null;
     }
 
-    String table = datasets.get(pullRequest.getDatasetName()).getBigQueryTableName();
+    String table = datasets.get(pullRequest.getDatasetName()).getBigQueryTable();
 
-    return new BigQuerySparkDatasetProducer(sqlEngineConfig, datasetProject, dataset, table);
+    return new BigQuerySparkDatasetProducer(sqlEngineConfig,
+                                            datasetProject,
+                                            dataset,
+                                            table,
+                                            pullRequest.getDatasetSchema());
   }
 
   @Override
@@ -307,6 +332,34 @@ public class BigQuerySQLEngine
     }
 
     return Collections.singleton(DefaultPullCapability.SPARK_RDD_PULL);
+  }
+
+  @Override
+  public SQLWriteResult write(SQLWriteRequest writeRequest) {
+    String datasetName = writeRequest.getDatasetName();
+
+    // Check if direct sink write is enabled. If not, skip.
+    if (!sqlEngineConfig.shouldUseDirectSinkWrite()) {
+      return SQLWriteResult.unsupported(datasetName);
+    }
+
+    // Check if this output matches the expected engine. If it doesn't, skip execution for this write operation.;
+    if (!BigQuerySQLEngine.class.getName().equals(writeRequest.getOutput().getSqlEngineClassName())) {
+      LOG.debug("Got output for another SQL engine {}, skipping", writeRequest.getOutput().getSqlEngineClassName());
+      return SQLWriteResult.unsupported(datasetName);
+    }
+
+    // Get source table information (from the stage we are attempting to write into the sink)
+    String sourceTable = datasets.get(writeRequest.getDatasetName()).getBigQueryTable();
+    TableId sourceTableId = TableId.of(datasetProject, dataset, sourceTable);
+
+    // Build Big Query Write instance and execute write operation.
+    BigQueryWrite bigQueryWrite = BigQueryWrite.getInstance(datasetName,
+                                                            sqlEngineConfig,
+                                                            bigQuery,
+                                                            writeRequest,
+                                                            sourceTableId);
+    return bigQueryWrite.write();
   }
 
   @Override
@@ -335,7 +388,7 @@ public class BigQuerySQLEngine
       deleteTable(datasetName, bqDataset);
     } catch (BigQueryException e) {
       LOG.error("Exception when deleting BigQuery table '{}' for stage '{}': {}",
-                bqDataset.getBigQueryTableName(), datasetName, e.getMessage());
+                bqDataset.getBigQueryTable(), datasetName, e.getMessage());
       if (ex == null) {
         ex = new SQLEngineException(String.format("Exception when executing cleanup for stage '%s'", datasetName), e);
       } else {
@@ -363,6 +416,129 @@ public class BigQuerySQLEngine
   }
 
   /**
+   * @return capabilities provided by {@link BigQuerySQLEngine}, which include {@link StringExpressionFactoryType}.SQL.
+   */
+  @Override
+  public Set<Capability> getCapabilities() {
+    return Collections.singleton(StringExpressionFactoryType.SQL);
+  }
+
+  /**
+   * @return the single expression factory provided by {@link BigQuerySQLEngine}, which is {@link SQLExpressionFactory}.
+   */
+  @Override
+  public List<ExpressionFactory<?>> getExpressionFactories() {
+    return Collections.singletonList(new SQLExpressionFactory());
+  }
+
+  @Override
+  public Relation getRelation(SQLRelationDefinition relationDefinition) {
+    // Builds set of columns to be used for this relation based on the schema. This set maintains field order
+    Set<String> columnSet = new LinkedHashSet<>();
+    List<Schema.Field> fields = relationDefinition.getSchema().getFields();
+    if (fields != null) {
+      for (Schema.Field field : fields) {
+        columnSet.add(field.getName());
+      }
+    }
+    String datasetName = relationDefinition.getDatasetName();
+
+    return BigQueryRelation.getInstance(datasetName, columnSet);
+  }
+
+  @Override
+  public Engine getRelationalEngine() {
+    return this;
+  }
+
+  @Override
+  public boolean supportsRelationalTranform() {
+    return true;
+  }
+
+  @Override
+  public boolean supportsInputSchema(Schema schema) {
+    return BigQuerySQLEngineUtils.isSupportedSchema(schema);
+  }
+
+  @Override
+  public boolean supportsOutputSchema(Schema schema) {
+    return BigQuerySQLEngineUtils.isSupportedSchema(schema);
+  }
+
+  @Override
+  public Set<String> getIncludedStageNames() {
+    return sqlEngineConfig.getIncludedStages();
+  }
+
+  @Override
+  public Set<String> getExcludedStageNames() {
+    return sqlEngineConfig.getExcludedStages();
+  }
+
+  @Override
+  public boolean canTransform(SQLTransformDefinition transformDefinition) {
+    Relation relation = transformDefinition.getOutputRelation();
+    return relation instanceof BigQueryRelation && relation.isValid();
+  }
+
+  @Override
+  public SQLDataset transform(SQLTransformRequest context) throws SQLEngineException {
+    // Get relation instance
+    BigQueryRelation relation = (BigQueryRelation) context.getOutputRelation();
+
+    // Set input datasets
+    Map<String, BigQuerySQLDataset> bqDatasets = context.getInputDataSets().entrySet()
+      .stream()
+      .collect(Collectors.toMap(
+        Map.Entry::getKey,
+        e -> (BigQuerySQLDataset) e.getValue()));
+
+    // Set input datasets for relation.
+    relation.setInputDatasets(bqDatasets);
+
+    // Execute select with the generated expression.
+    return executeSelect(context.getOutputDatasetName(),
+                         context.getOutputSchema(),
+                         BigQueryJobType.TRANSFORM,
+                         relation.getSQLStatement());
+  }
+
+  private BigQuerySelectDataset executeSelect(String datasetName,
+                                              Schema outputSchema,
+                                              BigQueryJobType jobType,
+                                              String query) {
+    LOG.info("Executing {} operation for dataset {}", jobType.getType(), datasetName);
+
+    // Get new Job ID for this push operation
+    String jobId = BigQuerySQLEngineUtils.newIdentifier();
+
+    // Build new table name for this dataset
+    String table = BigQuerySQLEngineUtils.getNewTableName(runId);
+
+    // Create empty table to store query results.
+    BigQuerySQLEngineUtils.createEmptyTable(sqlEngineConfig, bigQuery, project, dataset, table);
+
+    BigQuerySelectDataset selectDataset = BigQuerySelectDataset.getInstance(
+      datasetName,
+      outputSchema,
+      sqlEngineConfig,
+      bigQuery,
+      project,
+      DatasetId.of(datasetProject, dataset),
+      table,
+      jobId,
+      jobType,
+      query
+    ).execute();
+
+    datasets.put(datasetName, selectDataset);
+
+    LOG.info("Executed {} operation for dataset {}", jobType.getType(), datasetName);
+    return selectDataset;
+  }
+
+  /**
    * Get a map that contains stage names as keys and BigQuery tables as Values.
    *
    * @return map representing all stages currently pushed to BQ.
@@ -372,7 +548,7 @@ public class BigQuerySQLEngine
       .stream()
       .collect(Collectors.toMap(
         Map.Entry::getKey,
-        e -> e.getValue().getBigQueryTableName()
+        e -> e.getValue().getBigQueryTable()
       ));
   }
 
@@ -395,7 +571,7 @@ public class BigQuerySQLEngine
       return;
     }
 
-    String tableName = bqDataset.getBigQueryTableName();
+    String tableName = bqDataset.getBigQueryTable();
     Job job = bigQuery.getJob(jobId);
 
     if (job == null) {
@@ -419,7 +595,7 @@ public class BigQuerySQLEngine
       return;
     }
 
-    String tableName = bqDataset.getBigQueryTableName();
+    String tableName = bqDataset.getBigQueryTable();
     TableId tableId = TableId.of(datasetProject, dataset, tableName);
 
     if (!bigQuery.delete(tableId)) {

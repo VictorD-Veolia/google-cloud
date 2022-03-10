@@ -23,17 +23,21 @@ import com.google.cloud.bigquery.Job;
 import com.google.cloud.bigquery.JobId;
 import com.google.cloud.bigquery.JobInfo;
 import com.google.cloud.bigquery.QueryJobConfiguration;
+import com.google.cloud.bigquery.Table;
+import com.google.cloud.bigquery.TableDefinition;
 import com.google.cloud.bigquery.TableId;
 import io.cdap.cdap.api.data.schema.Schema;
 import io.cdap.cdap.etl.api.engine.sql.SQLEngineException;
 import io.cdap.cdap.etl.api.engine.sql.dataset.SQLDataset;
 import io.cdap.cdap.etl.api.engine.sql.request.SQLJoinRequest;
 import io.cdap.cdap.etl.api.join.JoinDefinition;
-import io.cdap.plugin.gcp.bigquery.sqlengine.builder.BigQuerySQLBuilder;
+import io.cdap.plugin.gcp.bigquery.sink.BigQuerySinkUtils;
+import io.cdap.plugin.gcp.bigquery.sqlengine.builder.BigQueryJoinSQLBuilder;
 import io.cdap.plugin.gcp.bigquery.sqlengine.util.BigQuerySQLEngineUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collections;
 import java.util.Map;
 import javax.annotation.Nullable;
 
@@ -52,7 +56,7 @@ public class BigQueryJoinDataset implements SQLDataset, BigQuerySQLDataset {
   private final DatasetId bqDataset;
   private final String bqTable;
   private final String jobId;
-  private final BigQuerySQLBuilder queryBuilder;
+  private final BigQueryJoinSQLBuilder queryBuilder;
   private Long numRows;
 
   private BigQueryJoinDataset(String datasetName,
@@ -72,7 +76,7 @@ public class BigQueryJoinDataset implements SQLDataset, BigQuerySQLDataset {
     this.bqDataset = bqDataset;
     this.bqTable = bqTable;
     this.jobId = jobId;
-    this.queryBuilder = new BigQuerySQLBuilder(this.joinDefinition, this.bqDataset, stageToTableNameMap);
+    this.queryBuilder = new BigQueryJoinSQLBuilder(this.joinDefinition, this.bqDataset, stageToTableNameMap);
   }
 
   public static BigQueryJoinDataset getInstance(SQLJoinRequest joinRequest,
@@ -116,13 +120,17 @@ public class BigQueryJoinDataset implements SQLDataset, BigQuerySQLDataset {
     String query = queryBuilder.getQuery();
     LOG.info("Creating table `{}` using job: {} with SQL statement: {}", bqTable, jobId, query);
 
+    // Update destination table schema to match configured schema in the pipeline.
+    updateTableSchema(destinationTable, joinDefinition.getOutputSchema());
+
     // Run BigQuery job with generated SQL statement, store results in a new table, and set priority to BATCH
     // TODO: Make priority configurable
     QueryJobConfiguration queryConfig =
       QueryJobConfiguration.newBuilder(query)
         .setDestinationTable(destinationTable)
         .setCreateDisposition(JobInfo.CreateDisposition.CREATE_NEVER)
-        .setWriteDisposition(JobInfo.WriteDisposition.WRITE_TRUNCATE)
+        .setWriteDisposition(JobInfo.WriteDisposition.WRITE_APPEND)
+        .setSchemaUpdateOptions(Collections.singletonList(JobInfo.SchemaUpdateOption.ALLOW_FIELD_ADDITION))
         .setPriority(sqlEngineConfig.getJobPriority())
         .setLabels(BigQuerySQLEngineUtils.getJobTags("join"))
         .build();
@@ -171,7 +179,17 @@ public class BigQueryJoinDataset implements SQLDataset, BigQuerySQLDataset {
   }
 
   @Override
-  public String getBigQueryTableName() {
+  public String getBigQueryProject() {
+    return bqDataset.getProject();
+  }
+
+  @Override
+  public String getBigQueryDataset() {
+    return bqDataset.getDataset();
+  }
+
+  @Override
+  public String getBigQueryTable() {
     return bqTable;
   }
 
@@ -184,5 +202,18 @@ public class BigQueryJoinDataset implements SQLDataset, BigQuerySQLDataset {
   @Override
   public String getJobId() {
     return jobId;
+  }
+
+  protected void updateTableSchema(TableId tableId, Schema schema) {
+    // Get BigQuery schema for this table
+    com.google.cloud.bigquery.Schema bqSchema = BigQuerySinkUtils.convertCdapSchemaToBigQuerySchema(schema);
+
+    // Get table and update definition to match the new schema
+    Table table = bigQuery.getTable(tableId);
+    TableDefinition updatedDefinition = table.getDefinition().toBuilder().setSchema(bqSchema).build();
+    Table updatedTable = table.toBuilder().setDefinition(updatedDefinition).build();
+
+    // Update table.
+    bigQuery.update(updatedTable);
   }
 }

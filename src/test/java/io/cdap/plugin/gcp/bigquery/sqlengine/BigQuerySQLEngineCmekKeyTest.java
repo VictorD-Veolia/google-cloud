@@ -92,9 +92,7 @@ public class BigQuerySQLEngineCmekKeyTest {
 
   @Test
   public void testServiceAccountPath() throws Exception {
-    BigQuerySQLEngineConfig.Builder builder = getBuilder()
-      .setServiceAccountType(GCPConfig.SERVICE_ACCOUNT_FILE_PATH)
-      .setServiceFilePath(serviceAccountFilePath);
+    BigQuerySQLEngineConfig.Builder builder = getBuilder();
     testValidCmekKey(builder);
     testInvalidCmekKeyName(builder);
     testInvalidCmekKeyLocation(builder);
@@ -105,9 +103,7 @@ public class BigQuerySQLEngineCmekKeyTest {
 
   @Test
   public void testServiceAccountJson() throws Exception {
-    BigQuerySQLEngineConfig.Builder builder = getBuilder()
-      .setServiceAccountType(GCPConfig.SERVICE_ACCOUNT_JSON)
-      .setServiceAccountJson(serviceAccountKey);
+    BigQuerySQLEngineConfig.Builder builder = getBuilder();
     testValidCmekKey(builder);
     testInvalidCmekKeyName(builder);
     testInvalidCmekKeyLocation(builder);
@@ -196,9 +192,9 @@ public class BigQuerySQLEngineCmekKeyTest {
       .build();
     DatasetId datasetId = DatasetId.of(project, dataset);
     // creating dataset before validating cmek key
-    BigQuerySinkUtils.createDataset(bigQuery, datasetId, location, null,
-                                    () -> String.format("Unable to create BigQuery dataset '%s.%s'",
-                                                        datasetId.getProject(), datasetId.getDataset()));
+    BigQuerySinkUtils.createDatasetIfNotExists(bigQuery, datasetId, location, null,
+                                               () -> String.format("Unable to create BigQuery dataset '%s.%s'",
+                                                                   datasetId.getProject(), datasetId.getDataset()));
     config.validateCmekKey(collector, Collections.emptyMap());
     Assert.assertEquals(0, collector.getValidationFailures().size());
     // deleting dataset after successful validation

@@ -29,6 +29,7 @@ import io.cdap.cdap.etl.api.join.JoinCondition;
 import io.cdap.cdap.etl.api.join.JoinDefinition;
 import io.cdap.cdap.etl.api.join.JoinStage;
 import io.cdap.plugin.gcp.bigquery.sink.BigQuerySinkUtils;
+import io.cdap.plugin.gcp.bigquery.sqlengine.BigQueryJobType;
 import io.cdap.plugin.gcp.bigquery.sqlengine.BigQuerySQLEngineConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -245,6 +246,16 @@ public class BigQuerySQLEngineUtils {
   }
 
   /**
+   * Check if the supplied schema is supported by the SQL Engine
+   *
+   * @param schema supplied schema to validate
+   * @return whether this schema is supported by the SQL engine.
+   */
+  public static boolean isSupportedSchema(Schema schema) {
+    return BigQuerySchemaValidation.validateSchema(schema).isSupported();
+  }
+
+  /**
    * Ensure the Stage name is valid for execution in BQ pushdown.
    * <p>
    * Due to differences in character escaping rules in Spark and BigQuery, identifiers that are accepted in Spark
@@ -256,6 +267,16 @@ public class BigQuerySQLEngineUtils {
    */
   public static boolean isValidIdentifier(String identifier) {
     return identifier != null && !identifier.contains("\\") && !identifier.contains("`");
+  }
+
+  /**
+   * Get tags for BQ Pushdown tags
+   *
+   * @param operation the current operation that is being executed
+   * @return Map containing tags for a job.
+   */
+  public static Map<String, String> getJobTags(BigQueryJobType operation) {
+    return getJobTags(operation.getType());
   }
 
   /**
